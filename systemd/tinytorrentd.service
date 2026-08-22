@@ -1,0 +1,23 @@
+[Unit]
+Description=TinyTorrent download daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust this path if `tinytorrentd` isn't where your systemd user
+# instance's PATH expects -- e.g. point it at a virtualenv's
+# bin/tinytorrentd if that's how TinyTorrent was installed.
+ExecStart=%h/.local/bin/tinytorrentd
+Restart=on-failure
+RestartSec=5
+
+# All daemon settings (download directory, state file, socket path,
+# max concurrent downloads) come from ~/.config/tinytorrent/config.json,
+# or TinyTorrent's built-in defaults if that file doesn't exist -- see
+# DESIGN.md. To skip the config file, override individual settings with
+# extra flags instead, e.g.:
+#   ExecStart=%h/.local/bin/tinytorrentd --download-dir %h/Downloads/tinytorrent --max-active 2
+
+[Install]
+WantedBy=default.target
