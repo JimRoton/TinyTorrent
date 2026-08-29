@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
+
+from tinytorrent.common.hooks import HookCommand, HookConfigError, HookEvent, parse_hooks_config
 
 _XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser()
 _XDG_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser()
@@ -21,6 +23,11 @@ DEFAULT_DOWNLOAD_DIR = Path("~/Downloads/tinytorrent").expanduser()
 DEFAULT_STATE_FILE = _XDG_STATE_HOME / "tinytorrent" / "state.json"
 DEFAULT_SOCKET_PATH = _XDG_RUNTIME_DIR / "tinytorrentd.sock"
 DEFAULT_MAX_ACTIVE = 4
+# How long the CLI waits for tinytorrentd to respond to one IPC request
+# (connect + read the response line) before giving up. Distinct from a
+# hook command's own `timeout_seconds` in the `hooks` config -- this one
+# governs the CLI<->daemon socket round trip, not a hook subprocess.
+DEFAULT_IPC_TIMEOUT_SECONDS = 15.0
 
 _PATH_FIELDS = {"download_dir", "state_file", "socket_path"}
 
@@ -35,6 +42,11 @@ class Config:
     state_file: Path = DEFAULT_STATE_FILE
     socket_path: Path = DEFAULT_SOCKET_PATH
     max_active: int = DEFAULT_MAX_ACTIVE
+    ipc_timeout_seconds: float = DEFAULT_IPC_TIMEOUT_SECONDS
+    # Event hooks (see DESIGN.md): config-file only, no CLI flag
+    # equivalent -- a list of argv commands per event doesn't map cleanly
+    # onto flags the way the scalar settings above do.
+    hooks: "dict[HookEvent, tuple[HookCommand, ...]]" = field(default_factory=dict)
 
     @staticmethod
     def load(config_path: "Path | None" = None) -> "Config":
@@ -75,6 +87,19 @@ def _apply(config: Config, raw: dict) -> Config:
             if max_active < 1:
                 raise ConfigError("'max_active' must be at least 1")
             updates[key] = max_active
+        elif key == "ipc_timeout_seconds":
+            try:
+                ipc_timeout_seconds = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ConfigError(f"'ipc_timeout_seconds' must be a number, got {value!r}") from exc
+            if ipc_timeout_seconds <= 0:
+                raise ConfigError("'ipc_timeout_seconds' must be greater than 0")
+            updates[key] = ipc_timeout_seconds
+        elif key == "hooks":
+            try:
+                updates[key] = parse_hooks_config(value)
+            except HookConfigError as exc:
+                raise ConfigError(str(exc)) from exc
         else:
             updates[key] = value
     return replace(config, **updates)

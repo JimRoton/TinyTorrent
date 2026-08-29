@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
+from tinytorrent.common.hooks import HookEvent
 from tinytorrent.common.ids import generate_peer_id
 from tinytorrent.common.priority import Priority
 from tinytorrent.daemon import metadata_exchange as me
@@ -225,6 +226,8 @@ class TestTorrentSessionEndToEnd:
         metadata_bytes = bencode_encode(info_dict)
         info_hash = _hash(metadata_bytes)
 
+        events = []
+
         async def scenario():
             async def handler(reader, writer):
                 await _seeding_peer_handler(
@@ -248,7 +251,13 @@ class TestTorrentSessionEndToEnd:
                 async with peer_server:
                     tracker_url = f"http://127.0.0.1:{http_server.server_port}/announce"
                     magnet = MagnetLink(info_hash=info_hash, display_name="hello.txt", trackers=(tracker_url,))
-                    session = TorrentSession("t1", magnet, tmp_path, generate_peer_id())
+                    session = TorrentSession(
+                        "t1",
+                        magnet,
+                        tmp_path,
+                        generate_peer_id(),
+                        on_event=lambda event, _session: events.append(event),
+                    )
                     await asyncio.wait_for(session.download(), timeout=15)
             finally:
                 http_server.shutdown()
@@ -263,6 +272,11 @@ class TestTorrentSessionEndToEnd:
         assert session.completed_pieces == set(range(num_pieces))
         downloaded = (tmp_path / "hello.txt").read_bytes()
         assert downloaded == content
+        assert events == [
+            HookEvent.METADATA_FETCHED,
+            HookEvent.DOWNLOAD_STARTED,
+            HookEvent.DOWNLOAD_COMPLETED,
+        ]
 
     def test_no_trackers_results_in_error_status(self, tmp_path, monkeypatch):
         monkeypatch.setattr(ts, "METADATA_RETRY_DELAY", 0.01)
@@ -273,3 +287,74 @@ class TestTorrentSessionEndToEnd:
 
         assert session.status == TorrentStatus.ERROR
         assert session.error_message is not None
+
+
+class TestLifecycleEvents:
+    def test_firing_without_a_callback_is_harmless(self):
+        session = _make_session()
+        session._fire(HookEvent.DOWNLOAD_COMPLETED)  # no on_event wired
+
+    def test_callback_receives_the_event_and_session(self):
+        received = []
+        magnet = MagnetLink(info_hash=b"\x00" * 20, display_name="x", trackers=())
+        session = TorrentSession(
+            "abcd",
+            magnet,
+            "/tmp/unused",
+            generate_peer_id(),
+            on_event=lambda event, s: received.append((event, s)),
+        )
+        session._fire(HookEvent.DOWNLOAD_STARTED)
+        assert received == [(HookEvent.DOWNLOAD_STARTED, session)]
+
+    def test_failure_fires_download_error(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ts, "METADATA_RETRY_DELAY", 0.01)
+        events = []
+        magnet = MagnetLink(info_hash=b"\x00" * 20, display_name=None, trackers=())
+        session = TorrentSession(
+            "t9",
+            magnet,
+            tmp_path,
+            generate_peer_id(),
+            on_event=lambda event, _s: events.append(event),
+        )
+
+        asyncio.run(asyncio.wait_for(session.download(), timeout=5))
+
+        assert session.status == TorrentStatus.ERROR
+        assert events == [HookEvent.DOWNLOAD_ERROR]
+
+    def test_already_complete_on_disk_does_not_fire_download_completed(self, tmp_path):
+        # Resuming a finished torrent after a restart re-verifies it from
+        # disk. That must not re-trigger the user's completion hooks.
+        content = b"tinytorrent completed content!!"
+        piece_length = 16
+        num_pieces = -(-len(content) // piece_length)
+        pieces_hashes = b"".join(
+            _hash(content[i * piece_length: (i + 1) * piece_length]) for i in range(num_pieces)
+        )
+        info = parse_info_dict(
+            {
+                b"name": b"done.txt",
+                b"piece length": piece_length,
+                b"pieces": pieces_hashes,
+                b"length": len(content),
+            }
+        )
+        (tmp_path / "done.txt").write_bytes(content)
+
+        events = []
+        magnet = MagnetLink(info_hash=b"\x00" * 20, display_name=None, trackers=())
+        session = TorrentSession(
+            "t8",
+            magnet,
+            tmp_path,
+            generate_peer_id(),
+            info=info,
+            on_event=lambda event, _s: events.append(event),
+        )
+
+        asyncio.run(asyncio.wait_for(session.download(), timeout=5))
+
+        assert session.status == TorrentStatus.COMPLETE
+        assert events == []

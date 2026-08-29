@@ -60,7 +60,13 @@ def main(argv: "list[str] | None" = None) -> int:
 
 async def _run(config: Config) -> None:
     peer_id = generate_peer_id()
-    manager = DaemonManager(config.download_dir, config.state_file, peer_id, max_active=config.max_active)
+    manager = DaemonManager(
+        config.download_dir,
+        config.state_file,
+        peer_id,
+        max_active=config.max_active,
+        hooks=config.hooks,
+    )
     await manager.load_from_disk()
 
     server = IPCServer(manager, config.socket_path)

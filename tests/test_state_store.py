@@ -104,3 +104,66 @@ class TestMalformedInput:
         path.write_text(json.dumps({"version": 1, "torrents": [entry]}), encoding="utf-8")
         with pytest.raises(StateStoreError):
             load(path)
+
+
+class TestPausedField:
+    def test_defaults_to_false(self):
+        record = TorrentRecord("a3f9", "magnet:?xt=urn:btih:" + "00" * 20, Priority.NORMAL)
+        assert record.paused is False
+
+    def test_round_trips_true(self, tmp_path):
+        path = tmp_path / "state.json"
+        records = [
+            TorrentRecord("a3f9", "magnet:?xt=urn:btih:" + "00" * 20, Priority.NORMAL, paused=True)
+        ]
+        save(path, records)
+        assert load(path)[0].paused is True
+
+    def test_round_trips_false(self, tmp_path):
+        path = tmp_path / "state.json"
+        records = [
+            TorrentRecord("a3f9", "magnet:?xt=urn:btih:" + "00" * 20, Priority.NORMAL, paused=False)
+        ]
+        save(path, records)
+        assert load(path)[0].paused is False
+
+    def test_written_to_the_json_payload(self, tmp_path):
+        path = tmp_path / "state.json"
+        save(path, [TorrentRecord("a3f9", "magnet:?xt=urn:btih:" + "00" * 20, Priority.LOW, paused=True)])
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["torrents"][0]["paused"] is True
+
+    def test_absent_in_older_state_files_defaults_to_false(self, tmp_path):
+        # State files written before pause existed have no "paused" key.
+        path = tmp_path / "state.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "torrents": [
+                        {"id": "a3f9", "magnet": "magnet:?xt=urn:btih:" + "00" * 20, "priority": "normal"}
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert load(path)[0].paused is False
+
+    def test_paused_survives_alongside_an_info_dict(self, tmp_path):
+        path = tmp_path / "state.json"
+        info_dict = {b"name": b"file.txt", b"piece length": 16384, b"pieces": b"x" * 20, b"length": 100}
+        save(
+            path,
+            [
+                TorrentRecord(
+                    "a3f9",
+                    "magnet:?xt=urn:btih:" + "00" * 20,
+                    Priority.HIGH,
+                    info_dict=info_dict,
+                    paused=True,
+                )
+            ],
+        )
+        loaded = load(path)[0]
+        assert loaded.paused is True
+        assert loaded.info_dict == info_dict
