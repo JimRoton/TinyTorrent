@@ -581,3 +581,114 @@ class TestDaemonEventTestCommand:
                     writer.close()
 
         _run(scenario())
+
+
+class TestPurgeErrors:
+    async def _add_errored(self, fx, reader, writer, name, hash_byte):
+        added = await _send(
+            reader,
+            writer,
+            {"cmd": "add", "args": {"magnet": _no_tracker_magnet(name=name, hash_byte=hash_byte)}},
+        )
+        torrent_id = added["data"]["id"]
+        fx.manager.get_torrent(torrent_id).status = TorrentStatus.ERROR
+        return torrent_id
+
+    def test_purges_every_errored_torrent(self, tmp_path):
+        async def scenario():
+            async with _ServerFixture(tmp_path) as fx:
+                reader, writer = await fx.connect()
+                try:
+                    first = await self._add_errored(fx, reader, writer, "bad-1", b"\x01")
+                    second = await self._add_errored(fx, reader, writer, "bad-2", b"\x02")
+
+                    resp = await _send(reader, writer, {"cmd": "purge", "args": {"errors": True}})
+                    assert resp["ok"] is True
+                    assert sorted(resp["data"]["purged"]) == sorted([first, second])
+                    assert fx.manager.list_torrents() == []
+                finally:
+                    writer.close()
+
+        _run(scenario())
+
+    def test_leaves_other_torrents_in_place(self, tmp_path):
+        async def scenario():
+            async with _ServerFixture(tmp_path) as fx:
+                reader, writer = await fx.connect()
+                try:
+                    errored = await self._add_errored(fx, reader, writer, "bad", b"\x01")
+                    added = await _send(
+                        reader,
+                        writer,
+                        {"cmd": "add", "args": {"magnet": _no_tracker_magnet(name="ok", hash_byte=b"\x09")}},
+                    )
+                    healthy = added["data"]["id"]
+                    fx.manager.get_torrent(healthy).status = TorrentStatus.QUEUED
+
+                    resp = await _send(reader, writer, {"cmd": "purge", "args": {"errors": True}})
+                    assert resp["data"]["purged"] == [errored]
+                    assert [s.torrent_id for s in fx.manager.list_torrents()] == [healthy]
+                finally:
+                    writer.close()
+
+        _run(scenario())
+
+    def test_reports_an_empty_list_when_nothing_errored(self, tmp_path):
+        async def scenario():
+            async with _ServerFixture(tmp_path) as fx:
+                reader, writer = await fx.connect()
+                try:
+                    resp = await _send(reader, writer, {"cmd": "purge", "args": {"errors": True}})
+                    assert resp["ok"] is True
+                    assert resp["data"]["purged"] == []
+                finally:
+                    writer.close()
+
+        _run(scenario())
+
+    def test_id_and_errors_together_are_rejected(self, tmp_path):
+        async def scenario():
+            async with _ServerFixture(tmp_path) as fx:
+                reader, writer = await fx.connect()
+                try:
+                    errored = await self._add_errored(fx, reader, writer, "bad", b"\x01")
+                    resp = await _send(
+                        reader, writer, {"cmd": "purge", "args": {"id": errored, "errors": True}}
+                    )
+                    assert resp["ok"] is False
+                    assert "cannot be combined" in resp["error"]
+                    # nothing was removed
+                    assert len(fx.manager.list_torrents()) == 1
+                finally:
+                    writer.close()
+
+        _run(scenario())
+
+    def test_purge_by_id_still_reports_what_it_removed(self, tmp_path):
+        async def scenario():
+            async with _ServerFixture(tmp_path) as fx:
+                reader, writer = await fx.connect()
+                try:
+                    added = await _send(
+                        reader, writer, {"cmd": "add", "args": {"magnet": _no_tracker_magnet()}}
+                    )
+                    torrent_id = added["data"]["id"]
+                    resp = await _send(reader, writer, {"cmd": "purge", "args": {"id": torrent_id}})
+                    assert resp["ok"] is True
+                    assert resp["data"]["purged"] == [torrent_id]
+                finally:
+                    writer.close()
+
+        _run(scenario())
+
+    def test_purge_without_id_or_errors_is_rejected(self, tmp_path):
+        async def scenario():
+            async with _ServerFixture(tmp_path) as fx:
+                reader, writer = await fx.connect()
+                try:
+                    resp = await _send(reader, writer, {"cmd": "purge", "args": {}})
+                    assert resp["ok"] is False
+                finally:
+                    writer.close()
+
+        _run(scenario())

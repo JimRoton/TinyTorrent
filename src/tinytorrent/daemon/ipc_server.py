@@ -115,10 +115,20 @@ async def _handle_add(manager: DaemonManager, args: "dict[str, Any]") -> Respons
 
 
 async def _handle_purge(manager: DaemonManager, args: "dict[str, Any]") -> Response:
-    torrent_id = _require_str(args, "id")
     with_data = bool(args.get("with_data", False))
+
+    # "errors" purges every errored torrent instead of one by id. The two
+    # are mutually exclusive; the CLI enforces that too, but the daemon
+    # can be spoken to directly so it checks as well.
+    if bool(args.get("errors", False)):
+        if args.get("id"):
+            raise ValueError("'id' and 'errors' cannot be combined")
+        purged = await manager.purge_errored(with_data=with_data)
+        return Response.success({"purged": purged})
+
+    torrent_id = _require_str(args, "id")
     await manager.purge(torrent_id, with_data=with_data)
-    return Response.success()
+    return Response.success({"purged": [torrent_id]})
 
 
 async def _handle_list(manager: DaemonManager, _args: "dict[str, Any]") -> Response:

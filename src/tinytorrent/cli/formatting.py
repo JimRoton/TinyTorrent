@@ -6,6 +6,13 @@ from typing import Any
 
 _BYTE_UNITS = ["B", "KB", "MB", "GB", "TB", "PB"]
 
+# Torrent names routinely run to release-scene lengths that wrap the
+# terminal and wreck the column alignment. Only the display is
+# shortened -- the torrent's real name is untouched, so the files on
+# disk and every other command are unaffected.
+NAME_DISPLAY_LIMIT = 72
+_ELLIPSIS = "..."
+
 
 def format_bytes(n: "int | None") -> str:
     if n is None:
@@ -47,6 +54,20 @@ def format_progress(bytes_downloaded: "int | None", total_length: "int | None") 
     return f"{pct:.1f}%"
 
 
+def format_name(name: "str | None") -> str:
+    """Shorten a torrent name for display only.
+
+    Names longer than ``NAME_DISPLAY_LIMIT`` are cut to that many
+    characters with an ellipsis appended, so the truncation is visible
+    rather than silently losing the tail.
+    """
+    if not name:
+        return "-"
+    if len(name) <= NAME_DISPLAY_LIMIT:
+        return name
+    return name[:NAME_DISPLAY_LIMIT] + _ELLIPSIS
+
+
 def format_torrent_table(torrents: "list[dict[str, Any]]") -> str:
     if not torrents:
         return "No torrents."
@@ -55,7 +76,7 @@ def format_torrent_table(torrents: "list[dict[str, Any]]") -> str:
     rows = [
         [
             t["id"],
-            t["name"],
+            format_name(t["name"]),
             t["status"],
             t["priority"],
             format_progress(t.get("bytes_downloaded"), t.get("total_length")),

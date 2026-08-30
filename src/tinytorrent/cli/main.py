@@ -35,7 +35,15 @@ def build_parser() -> argparse.ArgumentParser:
     add_p.add_argument("--priority", choices=_PRIORITY_CHOICES, default="normal")
 
     purge_p = subparsers.add_parser("purge", help="remove a torrent, keeping any downloaded data")
-    purge_p.add_argument("id")
+    # Optional so `--errors` can stand in for it; exactly one of the two
+    # is required, which is checked in the handler so the error message
+    # can say something more useful than argparse's.
+    purge_p.add_argument("id", nargs="?", default=None)
+    purge_p.add_argument(
+        "--errors",
+        action="store_true",
+        help="purge every torrent in the error state instead of one by id",
+    )
     purge_p.add_argument("--with-data", action="store_true", help="also delete downloaded data")
 
     subparsers.add_parser("list", help="list torrents and their status")
@@ -119,13 +127,35 @@ def _cmd_add(config: Config, args: argparse.Namespace) -> int:
 
 
 def _cmd_purge(config: Config, args: argparse.Namespace) -> int:
+    if args.errors and args.id:
+        print("error: give an id or --errors, not both", file=sys.stderr)
+        return 1
+    if not args.errors and not args.id:
+        print("error: must provide a torrent id, or --errors", file=sys.stderr)
+        return 1
+
     response = ipc_client.call(
-        config.socket_path, "purge", {"id": args.id, "with_data": args.with_data}, timeout=config.ipc_timeout_seconds
+        config.socket_path,
+        "purge",
+        {"id": args.id, "errors": args.errors, "with_data": args.with_data},
+        timeout=config.ipc_timeout_seconds,
     )
     if not response.ok:
         print(f"error: {response.error}", file=sys.stderr)
         return 1
-    print(f"purged {args.id}" + (" (and deleted its data)" if args.with_data else ""))
+
+    suffix = " (and deleted its data)" if args.with_data else ""
+    if not args.errors:
+        print(f"purged {args.id}{suffix}")
+        return 0
+
+    purged = response.data.get("purged", [])
+    if not purged:
+        print("no torrents in the error state")
+        return 0
+    plural = "torrent" if len(purged) == 1 else "torrents"
+    data_suffix = " (and deleted their data)" if args.with_data else ""
+    print(f"purged {len(purged)} errored {plural}{data_suffix}: {', '.join(purged)}")
     return 0
 
 

@@ -81,7 +81,7 @@ class TestCommandHandlers:
 
         monkeypatch.setattr(cli_main.ipc_client, "call", fake_call)
         cli_main.main(["purge", "a3f9", "--with-data"])
-        assert captured["args"] == {"id": "a3f9", "with_data": True}
+        assert captured["args"] == {"id": "a3f9", "errors": False, "with_data": True}
 
     def test_list_renders_table(self, monkeypatch, capsys):
         torrents = [
@@ -508,3 +508,99 @@ class TestDaemonEventCliSupport:
         assert cli_main.main(["test", "--event", "daemon_started"]) == 0
         out = capsys.readouterr().out
         assert "repeats: every 1m" in out
+
+
+class TestPurgeErrorsArgParsing:
+    def test_id_is_optional(self):
+        args = cli_main.build_parser().parse_args(["purge", "--errors"])
+        assert args.errors is True
+        assert args.id is None
+
+    def test_id_still_accepted(self):
+        args = cli_main.build_parser().parse_args(["purge", "a3f9"])
+        assert args.id == "a3f9"
+        assert args.errors is False
+
+    def test_errors_with_data(self):
+        args = cli_main.build_parser().parse_args(["purge", "--errors", "--with-data"])
+        assert args.errors is True
+        assert args.with_data is True
+
+
+class TestPurgeErrorsHandler:
+    def test_sends_the_errors_flag(self, monkeypatch, capsys):
+        captured = {}
+
+        def fake_call(socket_path, cmd, args=None, timeout=15.0):
+            captured["args"] = args
+            return Response.success({"purged": ["a3f9", "b7c1"]})
+
+        monkeypatch.setattr(cli_main.ipc_client, "call", fake_call)
+        assert cli_main.main(["purge", "--errors"]) == 0
+        assert captured["args"] == {"id": None, "errors": True, "with_data": False}
+        out = capsys.readouterr().out
+        assert "purged 2 errored torrents" in out
+        assert "a3f9, b7c1" in out
+
+    def test_singular_wording_for_one_torrent(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            cli_main.ipc_client, "call", lambda *a, **kw: Response.success({"purged": ["a3f9"]})
+        )
+        assert cli_main.main(["purge", "--errors"]) == 0
+        assert "purged 1 errored torrent:" in capsys.readouterr().out
+
+    def test_reports_when_nothing_errored(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            cli_main.ipc_client, "call", lambda *a, **kw: Response.success({"purged": []})
+        )
+        assert cli_main.main(["purge", "--errors"]) == 0
+        assert "no torrents in the error state" in capsys.readouterr().out
+
+    def test_with_data_wording(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            cli_main.ipc_client, "call", lambda *a, **kw: Response.success({"purged": ["a3f9"]})
+        )
+        assert cli_main.main(["purge", "--errors", "--with-data"]) == 0
+        assert "deleted their data" in capsys.readouterr().out
+
+    def test_id_and_errors_together_rejected_before_contacting_daemon(self, monkeypatch, capsys):
+        def explode(*a, **kw):
+            raise AssertionError("the daemon should not have been contacted")
+
+        monkeypatch.setattr(cli_main.ipc_client, "call", explode)
+        assert cli_main.main(["purge", "a3f9", "--errors"]) == 1
+        assert "not both" in capsys.readouterr().err
+
+    def test_neither_id_nor_errors_rejected(self, monkeypatch, capsys):
+        def explode(*a, **kw):
+            raise AssertionError("the daemon should not have been contacted")
+
+        monkeypatch.setattr(cli_main.ipc_client, "call", explode)
+        assert cli_main.main(["purge"]) == 1
+        assert "must provide a torrent id, or --errors" in capsys.readouterr().err
+
+    def test_single_purge_still_prints_its_id(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            cli_main.ipc_client, "call", lambda *a, **kw: Response.success({"purged": ["a3f9"]})
+        )
+        assert cli_main.main(["purge", "a3f9"]) == 0
+        assert "purged a3f9" in capsys.readouterr().out
+
+
+class TestPurgeErrorsEndToEnd:
+    def test_through_real_daemon(self, tmp_path):
+        daemon = _BackgroundDaemon(tmp_path)
+        daemon.start()
+        try:
+            socket_arg = ["--socket", str(daemon.socket_path)]
+            for i in (1, 2):
+                magnet = f"magnet:?xt=urn:btih:{bytes([i]) * 20!r}"
+                magnet = "magnet:?xt=urn:btih:" + (f"{i:02x}" * 20) + f"&dn=bad-{i}"
+                assert cli_main.main([*socket_arg, "add", magnet]) == 0
+            for session in daemon.manager.list_torrents():
+                session.status = TorrentStatus.ERROR
+
+            assert cli_main.main([*socket_arg, "purge", "--errors"]) == 0
+            assert daemon.manager.list_torrents() == []
+        finally:
+            daemon.stop()

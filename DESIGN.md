@@ -139,7 +139,8 @@ The daemon-wide events take no `--id`/`--name`, since there is no torrent to res
 | `tinytorrent add <link>` | Add a torrent by link or magnet URI. |
 | `tinytorrent purge <id>` | Remove a torrent, keeping any downloaded data on disk. |
 | `tinytorrent purge <id> --with-data` | Remove a torrent and delete its downloaded data. |
-| `tinytorrent list` | List all torrents with status (downloading / queued / complete / verifying / error), current speed, and ETA. |
+| `tinytorrent purge --errors` | Remove every torrent in the error state. |
+| `tinytorrent list` | List all torrents with status (downloading / queued / paused / complete / verifying / error), current speed, and ETA. Names longer than 72 characters are truncated with an ellipsis for display only. |
 | `tinytorrent priority <id> <high\|normal\|low>` | Set a torrent's priority tier. |
 | `tinytorrent promote <id>` | Force a queued torrent into an active download slot. |
 | `tinytorrent pause <id>` | Stop a torrent and hold it out of scheduling until resumed. |
@@ -147,6 +148,20 @@ The daemon-wide events take no `--id`/`--name`, since there is no torrent to res
 | `tinytorrent test --event <event>` | Run an event's configured hook commands now and report each result. |
 
 Configuration (download directory, socket path, concurrency cap, IPC timeout, etc.) lives in a config file, and each of those scalar values can also be set directly via CLI flags, which override the file. The `hooks` section is the one exception — it is config-file only, for the reasons given above.
+
+## Bulk purge
+
+Errored torrents are the one category that accumulates: they occupy no slot and make no progress, but each still has to be cleared by id. `purge --errors` removes them as a group.
+
+It is deliberately scoped to the error state rather than being a general `--status <status>` filter. Bulk-removing *queued* or *downloading* torrents is a destructive operation with no obvious motivating case, and the narrow flag cannot be pointed at one by accident. An id and `--errors` are mutually exclusive; the CLI rejects the combination before contacting the daemon, and the daemon rejects it too, since it can be spoken to directly over its socket.
+
+The ids are collected before any removal begins, since each purge mutates the scheduler's torrent list. Each removal then goes through the same path as a single purge, so `torrent_purged` fires once per torrent and `--with-data` behaves identically.
+
+## Display truncation
+
+`list` truncates a torrent's displayed name to 72 characters plus an ellipsis. Torrent names frequently run past 100 characters, which wraps the terminal and destroys the column alignment that makes the listing readable.
+
+This is strictly a presentation concern, applied in the CLI's formatting layer. The daemon still sends the full name over IPC, the session's name is unchanged, and nothing about the files on disk is affected. The ellipsis is appended rather than the name being silently cut, so it is obvious that a name has been shortened.
 
 ## Explicitly Out of Scope (v1)
 

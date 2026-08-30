@@ -765,3 +765,111 @@ class TestTestHookForDaemonEvents:
 
         _run(scenario())
         assert len(ticks.read_text()) == 1
+
+
+class TestPurgeErrored:
+    async def _manager_with_errored(self, tmp_path, count=2, healthy=1, hooks=None):
+        manager = DaemonManager(
+            tmp_path / "downloads", tmp_path / "state.json", generate_peer_id(), hooks=hooks
+        )
+        errored = []
+        for i in range(count):
+            torrent_id = await manager.add_torrent(
+                _no_tracker_magnet(name=f"bad-{i}", hash_byte=bytes([i + 1]))
+            )
+            manager.get_torrent(torrent_id).status = TorrentStatus.ERROR
+            errored.append(torrent_id)
+        healthy_ids = []
+        for i in range(healthy):
+            torrent_id = await manager.add_torrent(
+                _no_tracker_magnet(name=f"ok-{i}", hash_byte=bytes([100 + i]))
+            )
+            manager.get_torrent(torrent_id).status = TorrentStatus.QUEUED
+            healthy_ids.append(torrent_id)
+        return manager, errored, healthy_ids
+
+    def test_removes_every_errored_torrent(self, tmp_path):
+        async def scenario():
+            manager, errored, _ = await self._manager_with_errored(tmp_path, count=3, healthy=0)
+            purged = await manager.purge_errored()
+            assert sorted(purged) == sorted(errored)
+            assert manager.list_torrents() == []
+
+        _run(scenario())
+
+    def test_leaves_healthy_torrents_alone(self, tmp_path):
+        async def scenario():
+            manager, errored, healthy = await self._manager_with_errored(tmp_path, count=2, healthy=2)
+            purged = await manager.purge_errored()
+            assert sorted(purged) == sorted(errored)
+            remaining = sorted(s.torrent_id for s in manager.list_torrents())
+            assert remaining == sorted(healthy)
+
+        _run(scenario())
+
+    def test_returns_empty_when_nothing_errored(self, tmp_path):
+        async def scenario():
+            manager, _, healthy = await self._manager_with_errored(tmp_path, count=0, healthy=2)
+            assert await manager.purge_errored() == []
+            assert len(manager.list_torrents()) == 2
+
+        _run(scenario())
+
+    def test_on_an_empty_daemon(self, tmp_path):
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", tmp_path / "state.json", generate_peer_id())
+            assert await manager.purge_errored() == []
+
+        _run(scenario())
+
+    def test_persists_the_removals(self, tmp_path):
+        state_file = tmp_path / "state.json"
+
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", state_file, generate_peer_id())
+            torrent_id = await manager.add_torrent(_no_tracker_magnet())
+            manager.get_torrent(torrent_id).status = TorrentStatus.ERROR
+            await manager.purge_errored()
+
+        _run(scenario())
+        payload = json.loads(state_file.read_text(encoding="utf-8"))
+        assert payload["torrents"] == []
+
+    def test_fires_the_purge_hook_for_each_torrent(self, tmp_path):
+        marker = tmp_path / "purged"
+
+        async def scenario():
+            hooks = {
+                HookEvent.TORRENT_PURGED: (_hook(_py(f"open({str(marker)!r}, 'a').write('x')")),)
+            }
+            manager, errored, _ = await self._manager_with_errored(
+                tmp_path, count=3, healthy=1, hooks=hooks
+            )
+            await manager.purge_errored()
+            await manager.hook_runner.wait_idle()
+            return len(errored)
+
+        count = _run(scenario())
+        assert len(marker.read_text()) == count
+
+    def test_with_data_deletes_files(self, tmp_path):
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", tmp_path / "state.json", generate_peer_id())
+            torrent_id = await manager.add_torrent(_no_tracker_magnet())
+            session = manager.get_torrent(torrent_id)
+            session.status = TorrentStatus.ERROR
+            info_dict = {
+                b"name": b"file.txt",
+                b"piece length": 16384,
+                b"pieces": hashlib.sha1(b"x").digest(),
+                b"length": 1,
+            }
+            session.info = parse_info_dict(info_dict)
+            session.storage = PieceStorage(session.info, manager.download_dir)
+            target = manager.download_dir / "file.txt"
+            assert target.exists()
+
+            await manager.purge_errored(with_data=True)
+            assert not target.exists()
+
+        _run(scenario())

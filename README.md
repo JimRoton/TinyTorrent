@@ -252,6 +252,28 @@ A command that a real firing would have skipped (because an earlier one
 failed with `on_failure: "abort_remaining"`) is still run and shown, but
 flagged as "would NOT have run in production."
 
+## Purging errored torrents
+
+`tinytorrent purge --errors` removes every torrent currently in the
+`error` state in one go, rather than one id at a time:
+
+```bash
+tinytorrent purge --errors                # remove them, keep any partial data
+tinytorrent purge --errors --with-data    # remove them and delete their data
+```
+
+It reports the ids it removed, and says so plainly when there was
+nothing to do. Torrents in any other state are untouched, and
+`torrent_purged` hooks fire once per removed torrent exactly as they do
+for a single purge. An id and `--errors` cannot be combined.
+
+## Display
+
+`tinytorrent list` truncates long torrent names to 72 characters
+followed by `...`, so a release-scene name can't wrap the terminal and
+break the column alignment. This affects the listing only — the
+torrent's real name is unchanged, and the files on disk are unaffected.
+
 ## Pause & resume
 
 `tinytorrent pause <id>` stops a torrent's download and holds it out of
@@ -272,5 +294,6 @@ tinytorrent promote <id>
 tinytorrent pause <id>
 tinytorrent resume <id>
 tinytorrent purge <id> [--with-data]
+tinytorrent purge --errors [--with-data]
 tinytorrent test --event <event> [--id <id>] [--name <name>] [--deleted-data]
 ```

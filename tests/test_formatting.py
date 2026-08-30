@@ -1,7 +1,9 @@
 from tinytorrent.cli.formatting import (
+    NAME_DISPLAY_LIMIT,
     format_bytes,
     format_eta,
     format_hook_test_results,
+    format_name,
     format_progress,
     format_speed,
     format_torrent_table,
@@ -265,3 +267,73 @@ class TestFormatHookTestResultsForDaemonEvents:
                 "daemon_started", None, None, _response([_result(interval_seconds=seconds)])
             )
             assert f"every {expected} " in text, f"{seconds}s rendered wrong: {text}"
+
+
+def _torrent(name, **overrides):
+    row = {
+        "id": "a3f9",
+        "name": name,
+        "status": "downloading",
+        "priority": "normal",
+        "bytes_downloaded": 5,
+        "total_length": 10,
+    }
+    row.update(overrides)
+    return row
+
+
+class TestFormatName:
+    def test_short_name_is_unchanged(self):
+        assert format_name("ubuntu.iso") == "ubuntu.iso"
+
+    def test_name_exactly_at_the_limit_is_unchanged(self):
+        name = "x" * NAME_DISPLAY_LIMIT
+        assert format_name(name) == name
+
+    def test_one_character_over_is_truncated(self):
+        name = "x" * (NAME_DISPLAY_LIMIT + 1)
+        assert format_name(name) == "x" * NAME_DISPLAY_LIMIT + "..."
+
+    def test_keeps_the_first_72_characters(self):
+        name = "".join(str(i % 10) for i in range(200))
+        assert format_name(name).startswith(name[:NAME_DISPLAY_LIMIT])
+
+    def test_truncated_output_is_limit_plus_ellipsis(self):
+        assert len(format_name("y" * 500)) == NAME_DISPLAY_LIMIT + 3
+
+    def test_ends_with_an_ellipsis_when_truncated(self):
+        assert format_name("z" * 200).endswith("...")
+
+    def test_empty_name(self):
+        assert format_name("") == "-"
+
+    def test_none_name(self):
+        assert format_name(None) == "-"
+
+
+class TestTorrentTableNameTruncation:
+    def test_long_name_is_truncated_in_the_table(self):
+        name = "A" * 120
+        text = format_torrent_table([_torrent(name)])
+        assert "A" * NAME_DISPLAY_LIMIT + "..." in text
+        assert name not in text
+
+    def test_short_name_appears_in_full(self):
+        text = format_torrent_table([_torrent("ubuntu-24.04.iso")])
+        assert "ubuntu-24.04.iso" in text
+
+    def test_truncation_does_not_change_other_columns(self):
+        text = format_torrent_table([_torrent("B" * 200, id="zzzz", status="error")])
+        assert "zzzz" in text
+        assert "error" in text
+
+    def test_column_stays_aligned_across_mixed_lengths(self):
+        text = format_torrent_table([_torrent("C" * 200), _torrent("tiny", id="b7c1")])
+        lines = text.splitlines()
+        # Every row pads to the same width, so STATUS starts at one column.
+        starts = [line.index("downloading") for line in lines[1:]]
+        assert len(set(starts)) == 1
+
+    def test_no_row_exceeds_the_display_limit_for_its_name(self):
+        text = format_torrent_table([_torrent("D" * 400)])
+        assert "D" * (NAME_DISPLAY_LIMIT + 1) not in text

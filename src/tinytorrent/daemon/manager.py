@@ -142,6 +142,27 @@ class DaemonManager:
         )
         self.save_state()
 
+    async def purge_errored(self, *, with_data: bool = False) -> "list[str]":
+        """Purge every torrent currently in the error state.
+
+        Errored torrents are the ones that accumulate: they hold a slot
+        against nothing and have to be cleared one id at a time. The ids
+        are collected up front rather than iterated live, since each
+        purge mutates the scheduler's torrent list.
+
+        Each removal goes through ``purge()``, so ``torrent_purged``
+        fires per torrent exactly as it would for a single purge.
+        Returns the ids removed, in list order.
+        """
+        errored = [
+            session.torrent_id
+            for session in self.scheduler.list_sessions()
+            if session.status == TorrentStatus.ERROR
+        ]
+        for torrent_id in errored:
+            await self.purge(torrent_id, with_data=with_data)
+        return errored
+
     async def test_hook(
         self,
         event: HookEvent,
