@@ -32,6 +32,10 @@ class TorrentRecord:
     magnet_uri: str
     priority: Priority
     info_dict: dict | None = None  # decoded bencode dict (bytes keys), once metadata is known
+    # Unlike download status generally (queued/downloading/etc., which is
+    # transient and re-derived on load), a pause is a deliberate user
+    # choice -- like priority -- so it's persisted and survives a restart.
+    paused: bool = False
 
 
 def load(path: Path) -> list[TorrentRecord]:
@@ -68,6 +72,7 @@ def _record_to_json(record: TorrentRecord) -> dict:
         "id": record.torrent_id,
         "magnet": record.magnet_uri,
         "priority": record.priority.value,
+        "paused": record.paused,
     }
     if record.info_dict is not None:
         entry["info_dict_b64"] = base64.b64encode(encode(record.info_dict)).decode("ascii")
@@ -83,6 +88,7 @@ def _record_from_json(entry: dict) -> TorrentRecord:
         priority = Priority(entry["priority"])
     except (KeyError, ValueError) as exc:
         raise StateStoreError(f"malformed torrent record: {entry!r}") from exc
+    paused = bool(entry.get("paused", False))  # absent in state files written before this feature
 
     info_dict = None
     b64_value = entry.get("info_dict_b64")
@@ -95,4 +101,6 @@ def _record_from_json(entry: dict) -> TorrentRecord:
         if not isinstance(info_dict, dict):
             raise StateStoreError(f"info_dict_b64 for torrent {torrent_id} did not decode to a dict")
 
-    return TorrentRecord(torrent_id=torrent_id, magnet_uri=magnet_uri, priority=priority, info_dict=info_dict)
+    return TorrentRecord(
+        torrent_id=torrent_id, magnet_uri=magnet_uri, priority=priority, info_dict=info_dict, paused=paused
+    )

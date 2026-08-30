@@ -8,6 +8,7 @@ from tinytorrent.common.ids import generate_peer_id
 from tinytorrent.common.ipc_protocol import Response
 from tinytorrent.daemon.ipc_server import IPCServer
 from tinytorrent.daemon.manager import DaemonManager
+from tinytorrent.daemon.torrent_session import TorrentStatus
 
 
 class TestArgParsing:
@@ -208,5 +209,247 @@ class TestEndToEnd:
             code = cli_main.main([*socket_arg, "purge", torrent_id])
             assert code == 0
             assert daemon.manager.list_torrents() == []
+        finally:
+            daemon.stop()
+
+
+class TestPauseResumeAndTestArgParsing:
+    def test_pause(self):
+        args = cli_main.build_parser().parse_args(["pause", "a3f9"])
+        assert args.command == "pause"
+        assert args.id == "a3f9"
+
+    def test_resume(self):
+        args = cli_main.build_parser().parse_args(["resume", "a3f9"])
+        assert args.command == "resume"
+        assert args.id == "a3f9"
+
+    def test_test_requires_an_event(self):
+        with pytest.raises(SystemExit):
+            cli_main.build_parser().parse_args(["test", "--id", "a3f9"])
+
+    def test_test_rejects_an_unknown_event(self):
+        with pytest.raises(SystemExit):
+            cli_main.build_parser().parse_args(["test", "--event", "download_finished", "--id", "a3f9"])
+
+    def test_test_accepts_every_documented_event(self):
+        parser = cli_main.build_parser()
+        for event in (
+            "metadata_fetched",
+            "download_started",
+            "download_completed",
+            "download_error",
+            "torrent_purged",
+        ):
+            args = parser.parse_args(["test", "--event", event, "--id", "a3f9"])
+            assert args.event == event
+
+    def test_test_with_name(self):
+        args = cli_main.build_parser().parse_args(
+            ["test", "--event", "download_completed", "--name", "ubuntu.iso"]
+        )
+        assert args.name == "ubuntu.iso"
+        assert args.id is None
+
+    def test_deleted_data_defaults_false(self):
+        args = cli_main.build_parser().parse_args(["test", "--event", "torrent_purged", "--id", "a3f9"])
+        assert args.deleted_data is False
+
+    def test_deleted_data_flag(self):
+        args = cli_main.build_parser().parse_args(
+            ["test", "--event", "torrent_purged", "--id", "a3f9", "--deleted-data"]
+        )
+        assert args.deleted_data is True
+
+    def test_timeout_flag_parses_as_float(self):
+        args = cli_main.build_parser().parse_args(["--timeout", "42.5", "list"])
+        assert args.ipc_timeout_seconds == 42.5
+
+    def test_timeout_defaults_to_none(self):
+        args = cli_main.build_parser().parse_args(["list"])
+        assert args.ipc_timeout_seconds is None
+
+
+class TestPauseResumeAndTestHandlers:
+    def test_pause_success(self, monkeypatch, capsys):
+        captured = {}
+
+        def fake_call(socket_path, cmd, args=None, timeout=15.0):
+            captured["cmd"] = cmd
+            captured["args"] = args
+            return Response.success()
+
+        monkeypatch.setattr(cli_main.ipc_client, "call", fake_call)
+        assert cli_main.main(["pause", "a3f9"]) == 0
+        assert captured["cmd"] == "pause"
+        assert captured["args"] == {"id": "a3f9"}
+        assert "paused a3f9" in capsys.readouterr().out
+
+    def test_pause_failure_returns_one(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            cli_main.ipc_client, "call", lambda *a, **kw: Response.failure("unknown torrent id 'a3f9'")
+        )
+        assert cli_main.main(["pause", "a3f9"]) == 1
+        assert "unknown torrent id" in capsys.readouterr().err
+
+    def test_resume_success(self, monkeypatch, capsys):
+        captured = {}
+
+        def fake_call(socket_path, cmd, args=None, timeout=15.0):
+            captured["cmd"] = cmd
+            return Response.success()
+
+        monkeypatch.setattr(cli_main.ipc_client, "call", fake_call)
+        assert cli_main.main(["resume", "a3f9"]) == 0
+        assert captured["cmd"] == "resume"
+        assert "resumed a3f9" in capsys.readouterr().out
+
+    def test_test_requires_id_or_name_before_contacting_the_daemon(self, monkeypatch, capsys):
+        def explode(*a, **kw):
+            raise AssertionError("the daemon should not have been contacted")
+
+        monkeypatch.setattr(cli_main.ipc_client, "call", explode)
+        assert cli_main.main(["test", "--event", "download_completed"]) == 1
+        assert "--id or --name" in capsys.readouterr().err
+
+    def test_test_sends_every_argument(self, monkeypatch, capsys):
+        captured = {}
+
+        def fake_call(socket_path, cmd, args=None, timeout=15.0):
+            captured["cmd"] = cmd
+            captured["args"] = args
+            return Response.success(
+                {"torrent_id": "a3f9", "torrent_name": "demo", "configured": False, "results": []}
+            )
+
+        monkeypatch.setattr(cli_main.ipc_client, "call", fake_call)
+        code = cli_main.main(
+            ["test", "--event", "torrent_purged", "--id", "a3f9", "--deleted-data"]
+        )
+        assert code == 0
+        assert captured["cmd"] == "test"
+        assert captured["args"] == {
+            "event": "torrent_purged",
+            "id": "a3f9",
+            "name": None,
+            "deleted_data": True,
+        }
+
+    def test_test_prints_results(self, monkeypatch, capsys):
+        def fake_call(socket_path, cmd, args=None, timeout=15.0):
+            return Response.success(
+                {
+                    "torrent_id": "a3f9",
+                    "torrent_name": "ubuntu.iso",
+                    "configured": True,
+                    "results": [
+                        {
+                            "argv": ["cp", "/dl/ubuntu.iso", "/done"],
+                            "outcome": "ok",
+                            "returncode": 0,
+                            "output": "",
+                            "on_failure": "ignore",
+                            "would_run_in_production": True,
+                        }
+                    ],
+                }
+            )
+
+        monkeypatch.setattr(cli_main.ipc_client, "call", fake_call)
+        assert cli_main.main(["test", "--event", "download_completed", "--id", "a3f9"]) == 0
+        out = capsys.readouterr().out
+        assert "ubuntu.iso" in out
+        assert "cp /dl/ubuntu.iso /done" in out
+
+    def test_test_failure_returns_one(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            cli_main.ipc_client, "call", lambda *a, **kw: Response.failure("no torrent with id 'zzzz'")
+        )
+        assert cli_main.main(["test", "--event", "download_completed", "--id", "zzzz"]) == 1
+        assert "no torrent with id" in capsys.readouterr().err
+
+
+class TestIpcTimeoutThreading:
+    def test_default_timeout_is_passed_through(self, monkeypatch):
+        captured = {}
+
+        def fake_call(socket_path, cmd, args=None, timeout=None):
+            captured["timeout"] = timeout
+            return Response.success({"torrents": []})
+
+        monkeypatch.setattr(cli_main.ipc_client, "call", fake_call)
+        cli_main.main(["list"])
+        assert captured["timeout"] == 15.0
+
+    def test_timeout_flag_overrides_it(self, monkeypatch):
+        captured = {}
+
+        def fake_call(socket_path, cmd, args=None, timeout=None):
+            captured["timeout"] = timeout
+            return Response.success({"torrents": []})
+
+        monkeypatch.setattr(cli_main.ipc_client, "call", fake_call)
+        cli_main.main(["--timeout", "42", "list"])
+        assert captured["timeout"] == 42.0
+
+    def test_timeout_applies_to_every_command(self, monkeypatch):
+        seen = []
+
+        def fake_call(socket_path, cmd, args=None, timeout=None):
+            seen.append((cmd, timeout))
+            return Response.success({"id": "a3f9", "torrents": []})
+
+        monkeypatch.setattr(cli_main.ipc_client, "call", fake_call)
+        for argv in (
+            ["add", "magnet:?xt=urn:btih:aa"],
+            ["list"],
+            ["priority", "a3f9", "high"],
+            ["promote", "a3f9"],
+            ["pause", "a3f9"],
+            ["resume", "a3f9"],
+            ["purge", "a3f9"],
+        ):
+            cli_main.main(["--timeout", "7", *argv])
+        assert {timeout for _cmd, timeout in seen} == {7.0}
+
+
+class TestPauseResumeEndToEnd:
+    def test_pause_and_resume_through_real_daemon(self, tmp_path):
+        daemon = _BackgroundDaemon(tmp_path)
+        daemon.start()
+        try:
+            magnet = "magnet:?xt=urn:btih:" + "00" * 20 + "&dn=demo"
+            socket_arg = ["--socket", str(daemon.socket_path)]
+
+            assert cli_main.main([*socket_arg, "add", magnet]) == 0
+            session = daemon.manager.list_torrents()[0]
+            torrent_id = session.torrent_id
+            # The tracker-less magnet errors out as soon as its download
+            # task runs, and pausing a terminal torrent is correctly a
+            # no-op -- put it back in a pausable state so this exercises
+            # the CLI-to-daemon plumbing rather than that.
+            session.status = TorrentStatus.QUEUED
+
+            assert cli_main.main([*socket_arg, "pause", torrent_id]) == 0
+            assert daemon.manager.get_torrent(torrent_id).status.value == "paused"
+
+            assert cli_main.main([*socket_arg, "resume", torrent_id]) == 0
+            assert daemon.manager.get_torrent(torrent_id).status.value != "paused"
+        finally:
+            daemon.stop()
+
+    def test_test_command_through_real_daemon(self, tmp_path):
+        daemon = _BackgroundDaemon(tmp_path)
+        daemon.start()
+        try:
+            magnet = "magnet:?xt=urn:btih:" + "00" * 20 + "&dn=demo"
+            socket_arg = ["--socket", str(daemon.socket_path)]
+            assert cli_main.main([*socket_arg, "add", magnet]) == 0
+            torrent_id = daemon.manager.list_torrents()[0].torrent_id
+
+            code = cli_main.main(
+                [*socket_arg, "test", "--event", "download_completed", "--id", torrent_id]
+            )
+            assert code == 0
         finally:
             daemon.stop()

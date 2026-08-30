@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from tinytorrent.common.hooks import HookEvent
 from tinytorrent.common.ipc_protocol import IPCError, Request, Response
 from tinytorrent.common.priority import Priority
 from tinytorrent.common.priority import from_str as priority_from_str
@@ -138,12 +139,40 @@ async def _handle_promote(manager: DaemonManager, args: "dict[str, Any]") -> Res
     return Response.success()
 
 
+async def _handle_pause(manager: DaemonManager, args: "dict[str, Any]") -> Response:
+    torrent_id = _require_str(args, "id")
+    await manager.pause(torrent_id)
+    return Response.success()
+
+
+async def _handle_resume(manager: DaemonManager, args: "dict[str, Any]") -> Response:
+    torrent_id = _require_str(args, "id")
+    await manager.resume(torrent_id)
+    return Response.success()
+
+
+async def _handle_test(manager: DaemonManager, args: "dict[str, Any]") -> Response:
+    event = _parse_hook_event(args.get("event"))
+    torrent_id = args.get("id") or None
+    name = args.get("name") or None
+    if torrent_id is not None and not isinstance(torrent_id, str):
+        raise ValueError("'id' must be a string")
+    if name is not None and not isinstance(name, str):
+        raise ValueError("'name' must be a string")
+    deleted_data = bool(args.get("deleted_data", False))
+    result = await manager.test_hook(event, torrent_id=torrent_id, name=name, deleted_data=deleted_data)
+    return Response.success(result)
+
+
 _HANDLERS: "dict[str, Handler]" = {
     "add": _handle_add,
     "purge": _handle_purge,
     "list": _handle_list,
     "priority": _handle_priority,
     "promote": _handle_promote,
+    "pause": _handle_pause,
+    "resume": _handle_resume,
+    "test": _handle_test,
 }
 
 
@@ -158,6 +187,16 @@ def _parse_priority(value: Any) -> Priority:
     if not isinstance(value, str):
         raise ValueError("'priority' must be a string")
     return priority_from_str(value)
+
+
+def _parse_hook_event(value: Any) -> HookEvent:
+    if not isinstance(value, str):
+        raise ValueError("'event' must be a string")
+    try:
+        return HookEvent(value)
+    except ValueError:
+        valid = ", ".join(e.value for e in HookEvent)
+        raise ValueError(f"invalid event {value!r} (expected one of: {valid})") from None
 
 
 def _session_to_json(session: TorrentSession) -> "dict[str, Any]":

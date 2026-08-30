@@ -7,17 +7,26 @@ import sys
 from pathlib import Path
 
 from tinytorrent.cli import ipc_client
-from tinytorrent.cli.formatting import format_torrent_table
+from tinytorrent.cli.formatting import format_hook_test_results, format_torrent_table
 from tinytorrent.cli.ipc_client import DaemonUnreachableError
 from tinytorrent.common.config import Config, ConfigError, DEFAULT_CONFIG_PATH
+from tinytorrent.common.hooks import HookEvent
 
 _PRIORITY_CHOICES = ["high", "normal", "low"]
+_HOOK_EVENT_CHOICES = [e.value for e in HookEvent]
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tinytorrent", description="A minimal command-line BitTorrent client.")
     parser.add_argument("--config", type=Path, default=None, help=f"config file path (default: {DEFAULT_CONFIG_PATH})")
     parser.add_argument("--socket", dest="socket_path", type=Path, default=None, help="daemon Unix socket path")
+    parser.add_argument(
+        "--timeout",
+        dest="ipc_timeout_seconds",
+        type=float,
+        default=None,
+        help="seconds to wait for tinytorrentd to respond before giving up (default: 15)",
+    )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -38,6 +47,28 @@ def build_parser() -> argparse.ArgumentParser:
     promote_p = subparsers.add_parser("promote", help="force a queued torrent into an active download slot")
     promote_p.add_argument("id")
 
+    pause_p = subparsers.add_parser("pause", help="pause a torrent's download")
+    pause_p.add_argument("id")
+
+    resume_p = subparsers.add_parser("resume", help="resume a paused torrent")
+    resume_p.add_argument("id")
+
+    test_p = subparsers.add_parser(
+        "test", help="run an event's configured hook commands against a real torrent and show the results"
+    )
+    test_p.add_argument("--event", required=True, choices=_HOOK_EVENT_CHOICES, help="event to test")
+    test_p.add_argument("--id", default=None, help="torrent id to test against")
+    test_p.add_argument(
+        "--name",
+        default=None,
+        help="torrent name to test against (tried if --id is omitted, or not found and --name is also given)",
+    )
+    test_p.add_argument(
+        "--deleted-data",
+        action="store_true",
+        help="simulate %%deleted_data%% as true (only meaningful for --event torrent_purged)",
+    )
+
     return parser
 
 
@@ -50,7 +81,7 @@ def main(argv: "list[str] | None" = None) -> int:
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    config = config.with_overrides(socket_path=args.socket_path)
+    config = config.with_overrides(socket_path=args.socket_path, ipc_timeout_seconds=args.ipc_timeout_seconds)
 
     handlers = {
         "add": _cmd_add,
@@ -58,6 +89,9 @@ def main(argv: "list[str] | None" = None) -> int:
         "list": _cmd_list,
         "priority": _cmd_priority,
         "promote": _cmd_promote,
+        "pause": _cmd_pause,
+        "resume": _cmd_resume,
+        "test": _cmd_test,
     }
 
     try:
@@ -69,7 +103,12 @@ def main(argv: "list[str] | None" = None) -> int:
 
 
 def _cmd_add(config: Config, args: argparse.Namespace) -> int:
-    response = ipc_client.call(config.socket_path, "add", {"magnet": args.magnet, "priority": args.priority})
+    response = ipc_client.call(
+        config.socket_path,
+        "add",
+        {"magnet": args.magnet, "priority": args.priority},
+        timeout=config.ipc_timeout_seconds,
+    )
     if not response.ok:
         print(f"error: {response.error}", file=sys.stderr)
         return 1
@@ -78,7 +117,9 @@ def _cmd_add(config: Config, args: argparse.Namespace) -> int:
 
 
 def _cmd_purge(config: Config, args: argparse.Namespace) -> int:
-    response = ipc_client.call(config.socket_path, "purge", {"id": args.id, "with_data": args.with_data})
+    response = ipc_client.call(
+        config.socket_path, "purge", {"id": args.id, "with_data": args.with_data}, timeout=config.ipc_timeout_seconds
+    )
     if not response.ok:
         print(f"error: {response.error}", file=sys.stderr)
         return 1
@@ -87,7 +128,7 @@ def _cmd_purge(config: Config, args: argparse.Namespace) -> int:
 
 
 def _cmd_list(config: Config, _args: argparse.Namespace) -> int:
-    response = ipc_client.call(config.socket_path, "list", {})
+    response = ipc_client.call(config.socket_path, "list", {}, timeout=config.ipc_timeout_seconds)
     if not response.ok:
         print(f"error: {response.error}", file=sys.stderr)
         return 1
@@ -96,7 +137,9 @@ def _cmd_list(config: Config, _args: argparse.Namespace) -> int:
 
 
 def _cmd_priority(config: Config, args: argparse.Namespace) -> int:
-    response = ipc_client.call(config.socket_path, "priority", {"id": args.id, "priority": args.level})
+    response = ipc_client.call(
+        config.socket_path, "priority", {"id": args.id, "priority": args.level}, timeout=config.ipc_timeout_seconds
+    )
     if not response.ok:
         print(f"error: {response.error}", file=sys.stderr)
         return 1
@@ -105,11 +148,50 @@ def _cmd_priority(config: Config, args: argparse.Namespace) -> int:
 
 
 def _cmd_promote(config: Config, args: argparse.Namespace) -> int:
-    response = ipc_client.call(config.socket_path, "promote", {"id": args.id})
+    response = ipc_client.call(config.socket_path, "promote", {"id": args.id}, timeout=config.ipc_timeout_seconds)
     if not response.ok:
         print(f"error: {response.error}", file=sys.stderr)
         return 1
     print(f"promoted {args.id}")
+    return 0
+
+
+def _cmd_pause(config: Config, args: argparse.Namespace) -> int:
+    response = ipc_client.call(config.socket_path, "pause", {"id": args.id}, timeout=config.ipc_timeout_seconds)
+    if not response.ok:
+        print(f"error: {response.error}", file=sys.stderr)
+        return 1
+    print(f"paused {args.id}")
+    return 0
+
+
+def _cmd_resume(config: Config, args: argparse.Namespace) -> int:
+    response = ipc_client.call(config.socket_path, "resume", {"id": args.id}, timeout=config.ipc_timeout_seconds)
+    if not response.ok:
+        print(f"error: {response.error}", file=sys.stderr)
+        return 1
+    print(f"resumed {args.id}")
+    return 0
+
+
+def _cmd_test(config: Config, args: argparse.Namespace) -> int:
+    if not args.id and not args.name:
+        print("error: must provide --id or --name", file=sys.stderr)
+        return 1
+    response = ipc_client.call(
+        config.socket_path,
+        "test",
+        {"event": args.event, "id": args.id, "name": args.name, "deleted_data": args.deleted_data},
+        timeout=config.ipc_timeout_seconds,
+    )
+    if not response.ok:
+        print(f"error: {response.error}", file=sys.stderr)
+        return 1
+    print(
+        format_hook_test_results(
+            args.event, response.data["torrent_id"], response.data["torrent_name"], response.data
+        )
+    )
     return 0
 
 

@@ -1,6 +1,6 @@
 # TinyTorrent — Feature Design (v1)
 
-*Last updated: 2026-08-22*
+*Last updated: 2026-08-29*
 
 ## Overview
 
@@ -38,6 +38,68 @@ Every torrent has a priority tier: **high**, **normal**, or **low**, set at add-
 
 In addition to automatic preemption, `tinytorrent promote <id>` lets the user force a specific queued torrent into an active slot immediately, regardless of the priority comparison that would normally govern preemption. If a slot must be freed to make room, the same least-progress tie-break rule applies to choose which active torrent is evicted.
 
+### Pause & resume
+
+Preemption is something the scheduler does *to* a torrent; a pause is something the user does. `tinytorrent pause <id>` stops a torrent's download and holds it out of scheduling entirely, and `tinytorrent resume <id>` puts it back.
+
+The distinction that matters is what rebalancing is allowed to do. A preempted torrent goes back to **queued**, which means it is still a candidate — the moment a slot frees up it may be started again automatically. A **paused** torrent is not a candidate at all: rebalancing skips it, and no amount of slot availability or priority change will restart it. Only `resume` will. `promote` refuses a paused torrent too, rather than silently overriding the pause; resume it first.
+
+Pausing is otherwise identical to preemption in its effect on data: the download task is cancelled, whatever pieces were already verified and written stay on disk, and a later resume continues from that point rather than restarting.
+
+Resume deliberately does *not* force the torrent into an active slot the way `promote` does. It returns the torrent to normal priority-based contention — exactly the position a newly added torrent is in. Forcing a slot is what `promote` is for, and a user who wants that can resume and then promote.
+
+Unlike the rest of a torrent's status (queued / downloading / verifying — all transient and re-derived at startup), **a pause is persisted** in the state file alongside priority. Both are deliberate user choices rather than observations about the current run, so both must survive a `tinytorrentd` restart; a pause that silently lifted itself on reboot would be a bug. On load, the paused status is restored before the scheduler ever sees the torrent, so it is never briefly eligible for a slot during startup.
+
+## Event Hooks
+
+TinyTorrent can run user-configured commands when a torrent reaches certain points in its lifecycle — the motivating case being "do something with the files once the download finishes" (move them, compress them, copy them to a NAS, send a notification).
+
+### Events
+
+| Event | Fires when |
+|---|---|
+| `metadata_fetched` | The info dict has been fetched from a peer and parsed — the torrent's real name and size are known for the first time. |
+| `download_started` | The torrent has metadata and verified storage, still has pieces to fetch, and is entering its download loop. |
+| `download_completed` | The last needed piece was downloaded and verified. |
+| `download_error` | The download failed and the torrent entered the error state. |
+| `torrent_purged` | The torrent was removed via `purge`, after any `--with-data` deletion has happened. |
+
+`download_completed` fires only on the transition from downloading to complete. A torrent that is found already complete on startup — its pieces re-verified from disk after a restart — does **not** fire it. The event means "this just finished downloading", not "this is confirmed complete", so a daemon restart cannot re-trigger a user's hook commands for torrents that finished long ago.
+
+### Configuration
+
+Hooks live in the `hooks` section of `config.json` and have no CLI-flag equivalent. Every other setting is a scalar that maps naturally onto a flag; an ordered list of commands per event, each with its own failure and timeout policy, does not.
+
+Each event maps to an ordered list of commands. Commands for one event run sequentially, in the order listed.
+
+### Commands are argv lists, never shell strings
+
+A hook `command` is a list of arguments, executed directly rather than through `/bin/sh`. This is the central security decision in the feature.
+
+Hook commands interpolate `%placeholder%` values drawn from the torrent — including `%name%`, which comes from the torrent's info dict, which comes from an untrusted peer on the network. If commands were shell strings, a torrent crafted with a name containing shell metacharacters would achieve arbitrary command execution on the user's machine the moment a hook fired. Because substitution happens per-argument into an argv list that is never parsed by a shell, a hostile name is only ever a single literal argument.
+
+The cost is that shell features — pipes, `&&`, redirection, globbing — are unavailable inline. A user who needs them writes a small script and invokes that, which keeps the untrusted value confined to one argument of one command.
+
+Placeholders available to every event: `%id%`, `%name%`, `%status%`, `%download_dir%`, `%total_bytes%`, `%priority%`, `%info_hash%`. `torrent_purged` additionally provides `%deleted_data%` (`"true"`/`"false"`). An unrecognized placeholder is left as literal text rather than raising, since a bare `%` is a legal character in an argument.
+
+### Failure and timeout policy
+
+Each command has an `on_failure` of `ignore` (default — log it and run the next command for this event) or `abort_remaining` (skip this event's remaining commands). This scopes only to the event that failed; other events are unaffected. A `timeout_seconds` (default 60) bounds each command, and a command that exceeds it is killed and counted as a failure.
+
+`abort_remaining` exists because hook chains are often pipelines where later steps presuppose earlier ones — compress, then copy the archive, then delete it. If the compression fails there is no archive to copy, and running the rest would at best be noise and at worst destructive.
+
+### Fire-and-forget execution
+
+Firing an event schedules its commands as a background task and returns immediately. Neither the torrent that triggered the event nor the scheduler ever waits for a hook to finish, so a slow or hung command cannot stall downloading, block a slot, or delay preemption.
+
+The accepted consequence is that hook commands are not guaranteed to complete: the daemon does not wait for in-flight hooks when shutting down, so a long-running command can be cut short by a `systemctl restart`. Making shutdown block on arbitrary user commands would let a hung hook hold up a restart indefinitely, which is a worse failure than a hook occasionally not finishing.
+
+### Testing hooks
+
+`tinytorrent test --event <event>` runs an event's configured commands immediately, against a real torrent's real data, and reports each result. Hook configuration is otherwise painful to iterate on: the natural trigger for `download_completed` is a completed download, which is a slow and awkward thing to arrange on demand.
+
+`test` deliberately differs from a real firing in three ways. It runs synchronously and reports outcomes, rather than firing and forgetting. It runs *every* configured command even after one fails, ignoring `abort_remaining`, so the user learns whether each command works rather than only reaching the first broken one — while still flagging which commands a real firing would have skipped. And it never performs the underlying action: testing `torrent_purged` runs the purge hooks but purges nothing.
+
 ## Commands
 
 | Command | Description |
@@ -48,12 +110,14 @@ In addition to automatic preemption, `tinytorrent promote <id>` lets the user fo
 | `tinytorrent list` | List all torrents with status (downloading / queued / complete / verifying / error), current speed, and ETA. |
 | `tinytorrent priority <id> <high\|normal\|low>` | Set a torrent's priority tier. |
 | `tinytorrent promote <id>` | Force a queued torrent into an active download slot. |
+| `tinytorrent pause <id>` | Stop a torrent and hold it out of scheduling until resumed. |
+| `tinytorrent resume <id>` | Return a paused torrent to normal priority-based contention. |
+| `tinytorrent test --event <event>` | Run an event's configured hook commands now and report each result. |
 
-Configuration (download directory, socket path, concurrency cap, etc.) lives in a config file, but every config value can also be set directly via CLI flags, which override the file.
+Configuration (download directory, socket path, concurrency cap, IPC timeout, etc.) lives in a config file, and each of those scalar values can also be set directly via CLI flags, which override the file. The `hooks` section is the one exception — it is config-file only, for the reasons given above.
 
 ## Explicitly Out of Scope (v1)
 
-- Manual pause/resume as a user-facing command (the daemon still stops/resumes downloads internally for preemption, but there's no `pause` command)
 - Peer information / peer list display
 - Bandwidth limit configuration (priority governs allocation instead)
 - Seeding — the client only downloads

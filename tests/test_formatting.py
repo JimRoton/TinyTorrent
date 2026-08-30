@@ -1,6 +1,7 @@
 from tinytorrent.cli.formatting import (
     format_bytes,
     format_eta,
+    format_hook_test_results,
     format_progress,
     format_speed,
     format_torrent_table,
@@ -108,3 +109,126 @@ class TestFormatTorrentTable:
         lines = table.splitlines()
         # Header and both rows should be the same length once padded.
         assert len(lines[0]) == len(lines[1]) == len(lines[2])
+
+
+def _result(
+    argv=("cp", "a", "b"),
+    outcome="ok",
+    returncode=0,
+    output="",
+    on_failure="ignore",
+    would_run_in_production=True,
+):
+    return {
+        "argv": list(argv),
+        "outcome": outcome,
+        "returncode": returncode,
+        "output": output,
+        "on_failure": on_failure,
+        "would_run_in_production": would_run_in_production,
+    }
+
+
+def _response(results, configured=True):
+    return {"configured": configured, "results": results}
+
+
+class TestFormatHookTestResults:
+    def test_header_names_event_and_torrent(self):
+        text = format_hook_test_results(
+            "download_completed", "a3f9", "ubuntu.iso", _response([_result()])
+        )
+        assert "download_completed" in text
+        assert "a3f9" in text
+        assert "ubuntu.iso" in text
+
+    def test_no_hooks_configured(self):
+        text = format_hook_test_results(
+            "download_error", "a3f9", "ubuntu.iso", _response([], configured=False)
+        )
+        assert "No hooks configured" in text
+
+    def test_lists_each_command_with_a_counter(self):
+        text = format_hook_test_results(
+            "download_completed",
+            "a3f9",
+            "demo",
+            _response([_result(argv=("first",)), _result(argv=("second",))]),
+        )
+        assert "[1/2] first" in text
+        assert "[2/2] second" in text
+
+    def test_shows_the_substituted_argv(self):
+        text = format_hook_test_results(
+            "download_completed", "a3f9", "demo", _response([_result(argv=("cp", "/dl/demo", "/done"))])
+        )
+        assert "cp /dl/demo /done" in text
+
+    def test_ok_outcome(self):
+        text = format_hook_test_results("download_completed", "a3f9", "demo", _response([_result()]))
+        assert "ok" in text
+        assert "exit 0" in text
+
+    def test_failed_outcome(self):
+        text = format_hook_test_results(
+            "download_completed", "a3f9", "demo", _response([_result(outcome="failed", returncode=3)])
+        )
+        assert "FAILED" in text
+        assert "exit 3" in text
+
+    def test_timeout_outcome(self):
+        text = format_hook_test_results(
+            "download_completed",
+            "a3f9",
+            "demo",
+            _response([_result(outcome="timeout", returncode=None)]),
+        )
+        assert "TIMED OUT" in text
+        assert "exit" not in text
+
+    def test_start_error_outcome(self):
+        text = format_hook_test_results(
+            "download_completed",
+            "a3f9",
+            "demo",
+            _response([_result(outcome="start_error", returncode=None)]),
+        )
+        assert "COULD NOT START" in text
+
+    def test_includes_command_output(self):
+        text = format_hook_test_results(
+            "download_completed", "a3f9", "demo", _response([_result(output="hello from hook")])
+        )
+        assert "hello from hook" in text
+
+    def test_multiline_output_is_indented_per_line(self):
+        text = format_hook_test_results(
+            "download_completed", "a3f9", "demo", _response([_result(output="line one\nline two")])
+        )
+        assert "| line one" in text
+        assert "| line two" in text
+
+    def test_flags_commands_production_would_have_skipped(self):
+        text = format_hook_test_results(
+            "download_completed",
+            "a3f9",
+            "demo",
+            _response(
+                [
+                    _result(argv=("first",), outcome="failed", returncode=1, on_failure="abort_remaining"),
+                    _result(argv=("second",), would_run_in_production=False),
+                ]
+            ),
+        )
+        assert "would NOT have run in production" in text
+
+    def test_does_not_flag_commands_production_would_have_run(self):
+        text = format_hook_test_results(
+            "download_completed", "a3f9", "demo", _response([_result(), _result()])
+        )
+        assert "would NOT have run" not in text
+
+    def test_ends_with_a_single_newline(self):
+        text = format_hook_test_results("download_completed", "a3f9", "demo", _response([_result()]))
+        assert text.endswith("\n")
+        assert not text.endswith("\n\n")

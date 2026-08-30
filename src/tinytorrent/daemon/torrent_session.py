@@ -16,7 +16,9 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import Callable
 
+from tinytorrent.common.hooks import HookEvent
 from tinytorrent.common.priority import Priority
 from tinytorrent.daemon import torrent_info as ti
 from tinytorrent.daemon.magnet import MagnetLink
@@ -62,6 +64,7 @@ class TorrentStatus(str, Enum):
     DOWNLOADING = "downloading"
     COMPLETE = "complete"
     ERROR = "error"
+    PAUSED = "paused"  # set only by Scheduler.pause() -- never by TorrentSession itself
 
 
 @dataclass(frozen=True)
@@ -89,12 +92,14 @@ class TorrentSession:
         priority: Priority = Priority.NORMAL,
         info: ti.TorrentInfo | None = None,
         completed_pieces: set[int] | None = None,
+        on_event: "Callable[[HookEvent, TorrentSession], None] | None" = None,
     ) -> None:
         self.torrent_id = torrent_id
         self.magnet = magnet
         self.download_dir = Path(download_dir)
         self.our_peer_id = our_peer_id
         self.priority = priority
+        self._on_event = on_event
 
         self.status = TorrentStatus.QUEUED
         self.info = info
@@ -157,6 +162,10 @@ class TorrentSession:
         while len(self._rate_samples) > 1 and self._rate_samples[0][0] < cutoff:
             self._rate_samples.pop(0)
 
+    def _fire(self, event: HookEvent) -> None:
+        if self._on_event is not None:
+            self._on_event(event, self)
+
     # -- lifecycle -----------------------------------------------------
 
     async def download(self) -> None:
@@ -183,20 +192,29 @@ class TorrentSession:
                 )
 
             if not self._needed_pieces():
+                # Already fully present on disk -- e.g. resumed after a
+                # daemon restart and re-verified. Deliberately does NOT
+                # fire download_completed: that event means "just finished
+                # downloading", not "confirmed complete (again)", so a
+                # restart doesn't repeatedly re-trigger a user's hook
+                # commands for torrents that finished long ago.
                 self.status = TorrentStatus.COMPLETE
                 return
 
             self.status = TorrentStatus.DOWNLOADING
+            self._fire(HookEvent.DOWNLOAD_STARTED)
             await self._download_loop()
 
             if not self._needed_pieces():
                 self.status = TorrentStatus.COMPLETE
+                self._fire(HookEvent.DOWNLOAD_COMPLETED)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - any failure becomes torrent error state
             self.status = TorrentStatus.ERROR
             self.error_message = str(exc)
             logger.exception("torrent %s failed", self.torrent_id)
+            self._fire(HookEvent.DOWNLOAD_ERROR)
 
     # -- metadata acquisition ------------------------------------------
 
@@ -210,6 +228,7 @@ class TorrentSession:
                 info_dict = await self._try_peers_for_metadata(peers)
                 if info_dict is not None:
                     self.info = ti.parse_info_dict(info_dict)
+                    self._fire(HookEvent.METADATA_FETCHED)
                     return
             if attempt < MAX_METADATA_ANNOUNCE_ATTEMPTS:
                 await asyncio.sleep(METADATA_RETRY_DELAY)

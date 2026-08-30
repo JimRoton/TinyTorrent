@@ -23,6 +23,10 @@ MAX_ACTIVE_TORRENTS = 4
 
 _PRIORITY_RANK = {Priority.LOW: 0, Priority.NORMAL: 1, Priority.HIGH: 2}
 _FINISHED_STATUSES = {TorrentStatus.COMPLETE, TorrentStatus.ERROR}
+# Finished OR paused: neither is eligible to be picked up by rebalancing.
+# Paused is kept separate from _FINISHED_STATUSES because it's not
+# terminal -- resume() puts a torrent right back into contention.
+_NOT_SCHEDULABLE_STATUSES = _FINISHED_STATUSES | {TorrentStatus.PAUSED}
 
 
 class SchedulerError(Exception):
@@ -71,13 +75,47 @@ class Scheduler:
             managed = self._require(torrent_id)
             if managed.task is not None:
                 return  # already active
-            if managed.session.status in _FINISHED_STATUSES:
-                return  # nothing to promote
+            if managed.session.status in _NOT_SCHEDULABLE_STATUSES:
+                return  # nothing to promote (finished, or paused -- resume() it first)
             if len(self._active_managed()) >= self.max_active:
                 victim = self._weakest_active(self._active_managed())
                 if victim is not None:
                     await self._stop(victim)
             self._start(managed)
+
+    async def pause(self, torrent_id: str) -> None:
+        """Stop a torrent's download and hold it out of scheduling until resumed.
+
+        Unlike preemption (a torrent bumped back to QUEUED by a
+        higher-priority arrival), a paused torrent is never
+        auto-restarted by rebalancing -- it stays out of contention for
+        an active slot until resume() explicitly puts it back in.
+        Whatever pieces it already wrote to disk are untouched, exactly
+        like preemption.
+        """
+        async with self._lock:
+            managed = self._require(torrent_id)
+            if managed.session.status in _FINISHED_STATUSES:
+                return  # nothing to pause
+            if managed.session.status == TorrentStatus.PAUSED:
+                return  # already paused
+            await self._stop(managed)  # cancels if active; _stop() resets status to QUEUED
+            managed.session.status = TorrentStatus.PAUSED
+            await self._rebalance()  # pausing an active torrent frees its slot
+
+    async def resume(self, torrent_id: str) -> None:
+        """Make a paused torrent eligible for scheduling again.
+
+        This doesn't force it active the way promote() does -- it just
+        re-enters normal priority-based contention for a slot, exactly
+        like a torrent that was just added.
+        """
+        async with self._lock:
+            managed = self._require(torrent_id)
+            if managed.session.status != TorrentStatus.PAUSED:
+                return  # not paused, nothing to do
+            managed.session.status = TorrentStatus.QUEUED
+            await self._rebalance()
 
     async def shutdown(self) -> None:
         async with self._lock:
@@ -108,7 +146,7 @@ class Scheduler:
         return [
             m
             for m in self._torrents.values()
-            if m.task is None and m.session.status not in _FINISHED_STATUSES
+            if m.task is None and m.session.status not in _NOT_SCHEDULABLE_STATUSES
         ]
 
     async def _rebalance(self) -> None:

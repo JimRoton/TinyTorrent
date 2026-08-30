@@ -300,3 +300,236 @@ class TestShutdown:
             assert all(not scheduler.is_active(s.torrent_id) for s in sessions)
 
         _run(scenario())
+
+
+class TestPause:
+    def test_pause_stops_an_active_torrent(self):
+        async def scenario():
+            scheduler = Scheduler(max_active=2)
+            session = FakeSession("aaaa")
+            await scheduler.add(session)
+            await asyncio.sleep(0)
+            assert scheduler.is_active("aaaa")
+
+            await scheduler.pause("aaaa")
+            assert not scheduler.is_active("aaaa")
+            assert session.was_cancelled is True
+            assert session.status == TorrentStatus.PAUSED
+
+        _run(scenario())
+
+    def test_pause_frees_the_slot_for_a_queued_torrent(self):
+        async def scenario():
+            scheduler = Scheduler(max_active=1)
+            first = FakeSession("aaaa")
+            second = FakeSession("bbbb")
+            await scheduler.add(first)
+            await scheduler.add(second)
+            await asyncio.sleep(0)
+            assert scheduler.is_active("aaaa")
+            assert not scheduler.is_active("bbbb")
+
+            await scheduler.pause("aaaa")
+            await asyncio.sleep(0)
+            assert first.status == TorrentStatus.PAUSED
+            assert scheduler.is_active("bbbb")
+
+        _run(scenario())
+
+    def test_pause_a_queued_torrent(self):
+        async def scenario():
+            scheduler = Scheduler(max_active=1)
+            await scheduler.add(FakeSession("aaaa"))
+            queued = FakeSession("bbbb")
+            await scheduler.add(queued)
+            await asyncio.sleep(0)
+
+            await scheduler.pause("bbbb")
+            assert queued.status == TorrentStatus.PAUSED
+            assert queued.download_call_count == 0
+
+        _run(scenario())
+
+    def test_paused_torrent_is_not_picked_up_when_a_slot_frees(self):
+        async def scenario():
+            scheduler = Scheduler(max_active=1)
+            active = FakeSession("aaaa")
+            paused = FakeSession("bbbb")
+            await scheduler.add(active)
+            await scheduler.add(paused)
+            await asyncio.sleep(0)
+            await scheduler.pause("bbbb")
+
+            # The active torrent finishing frees the only slot; a queued
+            # torrent would be started here, but a paused one must not be.
+            active.finish()
+            await asyncio.sleep(0.05)
+            assert not scheduler.is_active("bbbb")
+            assert paused.status == TorrentStatus.PAUSED
+
+        _run(scenario())
+
+    def test_pausing_twice_is_a_noop(self):
+        async def scenario():
+            scheduler = Scheduler(max_active=2)
+            session = FakeSession("aaaa")
+            await scheduler.add(session)
+            await asyncio.sleep(0)
+            await scheduler.pause("aaaa")
+            await scheduler.pause("aaaa")
+            assert session.status == TorrentStatus.PAUSED
+
+        _run(scenario())
+
+    def test_pausing_a_finished_torrent_is_a_noop(self):
+        async def scenario():
+            scheduler = Scheduler(max_active=2)
+            session = FakeSession("aaaa")
+            await scheduler.add(session)
+            await asyncio.sleep(0)
+            session.finish()
+            await asyncio.sleep(0.05)
+            assert session.status == TorrentStatus.COMPLETE
+
+            await scheduler.pause("aaaa")
+            assert session.status == TorrentStatus.COMPLETE
+
+        _run(scenario())
+
+    def test_pause_unknown_id_raises(self):
+        async def scenario():
+            scheduler = Scheduler()
+            with pytest.raises(SchedulerError):
+                await scheduler.pause("zzzz")
+
+        _run(scenario())
+
+
+class TestResume:
+    def test_resume_returns_a_torrent_to_contention(self):
+        async def scenario():
+            scheduler = Scheduler(max_active=1)
+            session = FakeSession("aaaa")
+            await scheduler.add(session)
+            await asyncio.sleep(0)
+            await scheduler.pause("aaaa")
+
+            await scheduler.resume("aaaa")
+            await asyncio.sleep(0)
+            assert scheduler.is_active("aaaa")
+            assert session.status == TorrentStatus.DOWNLOADING
+
+        _run(scenario())
+
+    def test_resume_restarts_the_download_task(self):
+        async def scenario():
+            scheduler = Scheduler(max_active=1)
+            session = FakeSession("aaaa")
+            await scheduler.add(session)
+            await asyncio.sleep(0)
+            assert session.download_call_count == 1
+
+            await scheduler.pause("aaaa")
+            await scheduler.resume("aaaa")
+            await asyncio.sleep(0)
+            assert session.download_call_count == 2
+
+        _run(scenario())
+
+    def test_resume_does_not_force_a_slot(self):
+        # Unlike promote(), resume() only re-enters normal contention --
+        # a full slate of same-tier torrents keeps their slots.
+        async def scenario():
+            scheduler = Scheduler(max_active=1)
+            holder = FakeSession("aaaa")
+            paused = FakeSession("bbbb")
+            await scheduler.add(holder)
+            await scheduler.add(paused)
+            await asyncio.sleep(0)
+            await scheduler.pause("bbbb")
+
+            await scheduler.resume("bbbb")
+            await asyncio.sleep(0)
+            assert scheduler.is_active("aaaa")
+            assert not scheduler.is_active("bbbb")
+            assert paused.status == TorrentStatus.QUEUED
+
+        _run(scenario())
+
+    def test_resume_respects_priority_when_contending(self):
+        async def scenario():
+            scheduler = Scheduler(max_active=1)
+            low = FakeSession("aaaa", priority=Priority.LOW)
+            high = FakeSession("bbbb", priority=Priority.HIGH)
+            await scheduler.add(low)
+            await scheduler.add(high)  # preempts the low-priority torrent
+            await asyncio.sleep(0)
+            assert scheduler.is_active("bbbb")
+
+            await scheduler.pause("bbbb")
+            await asyncio.sleep(0)
+            assert scheduler.is_active("aaaa")
+
+            await scheduler.resume("bbbb")
+            await asyncio.sleep(0)
+            # Higher tier wins the slot back through normal preemption.
+            assert scheduler.is_active("bbbb")
+            assert not scheduler.is_active("aaaa")
+
+        _run(scenario())
+
+    def test_resuming_a_torrent_that_is_not_paused_is_a_noop(self):
+        async def scenario():
+            scheduler = Scheduler(max_active=2)
+            session = FakeSession("aaaa")
+            await scheduler.add(session)
+            await asyncio.sleep(0)
+            await scheduler.resume("aaaa")
+            await asyncio.sleep(0)
+            assert scheduler.is_active("aaaa")
+            assert session.download_call_count == 1
+
+        _run(scenario())
+
+    def test_resume_unknown_id_raises(self):
+        async def scenario():
+            scheduler = Scheduler()
+            with pytest.raises(SchedulerError):
+                await scheduler.resume("zzzz")
+
+        _run(scenario())
+
+
+class TestPromoteVersusPause:
+    def test_promote_refuses_a_paused_torrent(self):
+        async def scenario():
+            scheduler = Scheduler(max_active=2)
+            session = FakeSession("aaaa")
+            await scheduler.add(session)
+            await asyncio.sleep(0)
+            await scheduler.pause("aaaa")
+
+            await scheduler.promote("aaaa")
+            await asyncio.sleep(0)
+            assert not scheduler.is_active("aaaa")
+            assert session.status == TorrentStatus.PAUSED
+
+        _run(scenario())
+
+    def test_a_paused_torrent_is_never_evicted_to_make_room(self):
+        async def scenario():
+            scheduler = Scheduler(max_active=1)
+            paused = FakeSession("aaaa")
+            other = FakeSession("bbbb")
+            await scheduler.add(paused)
+            await asyncio.sleep(0)
+            await scheduler.pause("aaaa")
+            await scheduler.add(other)
+            await asyncio.sleep(0)
+
+            await scheduler.promote("bbbb")
+            await asyncio.sleep(0)
+            assert scheduler.is_active("bbbb")
+            assert paused.status == TorrentStatus.PAUSED
+
+        _run(scenario())

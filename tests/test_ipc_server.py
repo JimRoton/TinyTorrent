@@ -3,9 +3,14 @@ import json
 
 import pytest
 
+import sys
+
+from tinytorrent.common.hooks import HookCommand, HookEvent
 from tinytorrent.common.ids import generate_peer_id
 from tinytorrent.daemon.ipc_server import IPCServer
+from tinytorrent.daemon.hooks import HookRunner
 from tinytorrent.daemon.manager import DaemonManager
+from tinytorrent.daemon.torrent_session import TorrentStatus
 
 
 def _no_tracker_magnet(name="test-torrent", hash_byte=b"\x00"):
@@ -262,5 +267,245 @@ class TestServerLifecycle:
             assert socket_path.exists()
             await server.stop()
             assert not socket_path.exists()
+
+        _run(scenario())
+
+
+def _add_pausable(fx, reader, writer):
+    """Add a torrent and put it back in a pausable state.
+
+    The tracker-less magnet these tests use fails metadata acquisition
+    the moment its download task gets a slice of the event loop, which
+    an IPC round trip always gives it -- so by the time a second command
+    arrives the torrent is already in the terminal ERROR state, where
+    pausing is correctly a no-op. Resetting the status keeps these tests
+    about the pause/resume command plumbing; the scheduler's own pause
+    semantics are covered in test_scheduler.py.
+    """
+
+    async def add():
+        added = await _send(reader, writer, {"cmd": "add", "args": {"magnet": _no_tracker_magnet()}})
+        torrent_id = added["data"]["id"]
+        fx.manager.get_torrent(torrent_id).status = TorrentStatus.QUEUED
+        return torrent_id
+
+    return add()
+
+
+class TestPauseAndResumeCommands:
+    def test_pause_then_resume(self, tmp_path):
+        async def scenario():
+            async with _ServerFixture(tmp_path) as fx:
+                reader, writer = await fx.connect()
+                try:
+                    torrent_id = await _add_pausable(fx, reader, writer)
+
+                    resp = await _send(reader, writer, {"cmd": "pause", "args": {"id": torrent_id}})
+                    assert resp["ok"] is True
+                    assert fx.manager.get_torrent(torrent_id).status == TorrentStatus.PAUSED
+
+                    resp = await _send(reader, writer, {"cmd": "resume", "args": {"id": torrent_id}})
+                    assert resp["ok"] is True
+                    assert fx.manager.get_torrent(torrent_id).status != TorrentStatus.PAUSED
+                finally:
+                    writer.close()
+
+        _run(scenario())
+
+    def test_pause_shows_up_in_list_status(self, tmp_path):
+        async def scenario():
+            async with _ServerFixture(tmp_path) as fx:
+                reader, writer = await fx.connect()
+                try:
+                    torrent_id = await _add_pausable(fx, reader, writer)
+                    await _send(reader, writer, {"cmd": "pause", "args": {"id": torrent_id}})
+                    listed = await _send(reader, writer, {"cmd": "list", "args": {}})
+                    assert listed["data"]["torrents"][0]["status"] == "paused"
+                finally:
+                    writer.close()
+
+        _run(scenario())
+
+    def test_pause_is_persisted_to_the_state_file(self, tmp_path):
+        async def scenario():
+            async with _ServerFixture(tmp_path) as fx:
+                reader, writer = await fx.connect()
+                try:
+                    torrent_id = await _add_pausable(fx, reader, writer)
+                    await _send(reader, writer, {"cmd": "pause", "args": {"id": torrent_id}})
+                finally:
+                    writer.close()
+
+        _run(scenario())
+        payload = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+        assert payload["torrents"][0]["paused"] is True
+
+    def test_pause_requires_an_id(self, tmp_path):
+        async def scenario():
+            async with _ServerFixture(tmp_path) as fx:
+                reader, writer = await fx.connect()
+                try:
+                    resp = await _send(reader, writer, {"cmd": "pause", "args": {}})
+                    assert resp["ok"] is False
+                    assert "id" in resp["error"]
+                finally:
+                    writer.close()
+
+        _run(scenario())
+
+    def test_resume_requires_an_id(self, tmp_path):
+        async def scenario():
+            async with _ServerFixture(tmp_path) as fx:
+                reader, writer = await fx.connect()
+                try:
+                    resp = await _send(reader, writer, {"cmd": "resume", "args": {}})
+                    assert resp["ok"] is False
+                finally:
+                    writer.close()
+
+        _run(scenario())
+
+    def test_pause_unknown_id_reports_an_error(self, tmp_path):
+        async def scenario():
+            async with _ServerFixture(tmp_path) as fx:
+                reader, writer = await fx.connect()
+                try:
+                    resp = await _send(reader, writer, {"cmd": "pause", "args": {"id": "zzzz"}})
+                    assert resp["ok"] is False
+                    assert "zzzz" in resp["error"]
+                finally:
+                    writer.close()
+
+        _run(scenario())
+
+    def test_resume_unknown_id_reports_an_error(self, tmp_path):
+        async def scenario():
+            async with _ServerFixture(tmp_path) as fx:
+                reader, writer = await fx.connect()
+                try:
+                    resp = await _send(reader, writer, {"cmd": "resume", "args": {"id": "zzzz"}})
+                    assert resp["ok"] is False
+                finally:
+                    writer.close()
+
+        _run(scenario())
+
+
+class TestTestCommand:
+    def test_reports_no_hooks_configured(self, tmp_path):
+        async def scenario():
+            async with _ServerFixture(tmp_path) as fx:
+                reader, writer = await fx.connect()
+                try:
+                    added = await _send(
+                        reader, writer, {"cmd": "add", "args": {"magnet": _no_tracker_magnet()}}
+                    )
+                    resp = await _send(
+                        reader,
+                        writer,
+                        {"cmd": "test", "args": {"event": "download_completed", "id": added["data"]["id"]}},
+                    )
+                    assert resp["ok"] is True
+                    assert resp["data"]["configured"] is False
+                    assert resp["data"]["results"] == []
+                finally:
+                    writer.close()
+
+        _run(scenario())
+
+    def test_runs_configured_commands(self, tmp_path):
+        marker = tmp_path / "ran"
+
+        async def scenario():
+            async with _ServerFixture(tmp_path) as fx:
+                # The fixture builds a hook-less manager; give it a
+                # configured runner so the command has something to run.
+                fx.manager.hook_runner = HookRunner(
+                    {
+                        HookEvent.DOWNLOAD_COMPLETED: (
+                            HookCommand(
+                                argv=(sys.executable, "-c", f"open({str(marker)!r}, 'w').write('x')"),
+                                timeout_seconds=30.0,
+                            ),
+                        )
+                    }
+                )
+                reader, writer = await fx.connect()
+                try:
+                    added = await _send(
+                        reader, writer, {"cmd": "add", "args": {"magnet": _no_tracker_magnet()}}
+                    )
+                    resp = await _send(
+                        reader,
+                        writer,
+                        {"cmd": "test", "args": {"event": "download_completed", "id": added["data"]["id"]}},
+                    )
+                    assert resp["ok"] is True
+                    assert resp["data"]["configured"] is True
+                    assert resp["data"]["results"][0]["outcome"] == "ok"
+                finally:
+                    writer.close()
+
+        _run(scenario())
+        assert marker.exists()
+
+    def test_rejects_an_unknown_event(self, tmp_path):
+        async def scenario():
+            async with _ServerFixture(tmp_path) as fx:
+                reader, writer = await fx.connect()
+                try:
+                    added = await _send(
+                        reader, writer, {"cmd": "add", "args": {"magnet": _no_tracker_magnet()}}
+                    )
+                    resp = await _send(
+                        reader,
+                        writer,
+                        {"cmd": "test", "args": {"event": "download_finished", "id": added["data"]["id"]}},
+                    )
+                    assert resp["ok"] is False
+                    assert "download_finished" in resp["error"]
+                finally:
+                    writer.close()
+
+        _run(scenario())
+
+    def test_requires_an_event(self, tmp_path):
+        async def scenario():
+            async with _ServerFixture(tmp_path) as fx:
+                reader, writer = await fx.connect()
+                try:
+                    resp = await _send(reader, writer, {"cmd": "test", "args": {"id": "a3f9"}})
+                    assert resp["ok"] is False
+                    assert "event" in resp["error"]
+                finally:
+                    writer.close()
+
+        _run(scenario())
+
+    def test_unknown_torrent_reports_an_error(self, tmp_path):
+        async def scenario():
+            async with _ServerFixture(tmp_path) as fx:
+                reader, writer = await fx.connect()
+                try:
+                    resp = await _send(
+                        reader, writer, {"cmd": "test", "args": {"event": "download_completed", "id": "zzzz"}}
+                    )
+                    assert resp["ok"] is False
+                finally:
+                    writer.close()
+
+        _run(scenario())
+
+    def test_neither_id_nor_name_reports_an_error(self, tmp_path):
+        async def scenario():
+            async with _ServerFixture(tmp_path) as fx:
+                reader, writer = await fx.connect()
+                try:
+                    resp = await _send(
+                        reader, writer, {"cmd": "test", "args": {"event": "download_completed"}}
+                    )
+                    assert resp["ok"] is False
+                finally:
+                    writer.close()
 
         _run(scenario())

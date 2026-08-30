@@ -1,8 +1,11 @@
 import asyncio
 import hashlib
+import json
+import sys
 
 import pytest
 
+from tinytorrent.common.hooks import HookCommand, HookEvent
 from tinytorrent.common.ids import generate_peer_id
 from tinytorrent.common.priority import Priority
 from tinytorrent.daemon.manager import DaemonManager
@@ -215,5 +218,294 @@ class TestPersistenceRoundTrip:
             manager = DaemonManager(tmp_path / "downloads", tmp_path / "state.json", generate_peer_id())
             await manager.load_from_disk()
             assert manager.list_torrents() == []
+
+        _run(scenario())
+
+
+def _py(code: str) -> tuple[str, ...]:
+    return (sys.executable, "-c", code)
+
+
+def _hook(argv, on_failure="ignore", timeout_seconds=30.0) -> HookCommand:
+    return HookCommand(argv=tuple(argv), on_failure=on_failure, timeout_seconds=timeout_seconds)
+
+
+class TestPauseAndResume:
+    def test_pause_sets_paused_status(self, tmp_path):
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", tmp_path / "state.json", generate_peer_id())
+            torrent_id = await manager.add_torrent(_no_tracker_magnet())
+            await manager.pause(torrent_id)
+            assert manager.get_torrent(torrent_id).status == TorrentStatus.PAUSED
+
+        _run(scenario())
+
+    def test_resume_clears_paused_status(self, tmp_path):
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", tmp_path / "state.json", generate_peer_id())
+            torrent_id = await manager.add_torrent(_no_tracker_magnet())
+            await manager.pause(torrent_id)
+            await manager.resume(torrent_id)
+            assert manager.get_torrent(torrent_id).status != TorrentStatus.PAUSED
+
+        _run(scenario())
+
+    def test_pause_is_persisted(self, tmp_path):
+        state_file = tmp_path / "state.json"
+
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", state_file, generate_peer_id())
+            torrent_id = await manager.add_torrent(_no_tracker_magnet())
+            await manager.pause(torrent_id)
+            return torrent_id
+
+        torrent_id = _run(scenario())
+        payload = json.loads(state_file.read_text(encoding="utf-8"))
+        (entry,) = payload["torrents"]
+        assert entry["id"] == torrent_id
+        assert entry["paused"] is True
+
+    def test_resume_is_persisted(self, tmp_path):
+        state_file = tmp_path / "state.json"
+
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", state_file, generate_peer_id())
+            torrent_id = await manager.add_torrent(_no_tracker_magnet())
+            await manager.pause(torrent_id)
+            await manager.resume(torrent_id)
+
+        _run(scenario())
+        payload = json.loads(state_file.read_text(encoding="utf-8"))
+        assert payload["torrents"][0]["paused"] is False
+
+    def test_paused_state_survives_a_restart(self, tmp_path):
+        state_file = tmp_path / "state.json"
+
+        async def first_run():
+            manager = DaemonManager(tmp_path / "downloads", state_file, generate_peer_id())
+            torrent_id = await manager.add_torrent(_no_tracker_magnet())
+            await manager.pause(torrent_id)
+            return torrent_id
+
+        torrent_id = _run(first_run())
+
+        async def second_run():
+            manager = DaemonManager(tmp_path / "downloads", state_file, generate_peer_id())
+            await manager.load_from_disk()
+            session = manager.get_torrent(torrent_id)
+            assert session.status == TorrentStatus.PAUSED
+            # A restored pause must also keep the torrent out of an
+            # active slot, not merely label it.
+            assert not manager.scheduler.is_active(torrent_id)
+
+        _run(second_run())
+
+    def test_pause_unknown_id_raises(self, tmp_path):
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", tmp_path / "state.json", generate_peer_id())
+            with pytest.raises(SchedulerError):
+                await manager.pause("zzzz")
+
+        _run(scenario())
+
+    def test_resume_unknown_id_raises(self, tmp_path):
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", tmp_path / "state.json", generate_peer_id())
+            with pytest.raises(SchedulerError):
+                await manager.resume("zzzz")
+
+        _run(scenario())
+
+
+class TestHookWiring:
+    def test_sessions_are_wired_to_the_hook_runner(self, tmp_path):
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", tmp_path / "state.json", generate_peer_id())
+            torrent_id = await manager.add_torrent(_no_tracker_magnet())
+            session = manager.get_torrent(torrent_id)
+            # The session fires lifecycle events back at the manager,
+            # which is what turns them into hook runs.
+            assert session._on_event is not None
+
+        _run(scenario())
+
+    def test_purge_fires_the_torrent_purged_hook(self, tmp_path):
+        marker = tmp_path / "purged"
+
+        async def scenario():
+            hooks = {
+                HookEvent.TORRENT_PURGED: (
+                    _hook(_py(f"open({str(marker)!r}, 'w').write('x')")),
+                )
+            }
+            manager = DaemonManager(
+                tmp_path / "downloads", tmp_path / "state.json", generate_peer_id(), hooks=hooks
+            )
+            torrent_id = await manager.add_torrent(_no_tracker_magnet())
+            await manager.purge(torrent_id)
+            await manager.hook_runner.wait_idle()
+
+        _run(scenario())
+        assert marker.exists()
+
+    def test_purge_hook_receives_torrent_placeholders(self, tmp_path):
+        out = tmp_path / "context"
+
+        async def scenario():
+            argv = _py("import sys; open(sys.argv[1], 'w').write(sys.argv[2] + '|' + sys.argv[3])") + (
+                str(out),
+                "%name%",
+                "%deleted_data%",
+            )
+            hooks = {HookEvent.TORRENT_PURGED: (_hook(argv),)}
+            manager = DaemonManager(
+                tmp_path / "downloads", tmp_path / "state.json", generate_peer_id(), hooks=hooks
+            )
+            torrent_id = await manager.add_torrent(_no_tracker_magnet(name="my-torrent"))
+            await manager.purge(torrent_id, with_data=True)
+            await manager.hook_runner.wait_idle()
+
+        _run(scenario())
+        assert out.read_text() == "my-torrent|true"
+
+    def test_purge_without_data_reports_deleted_data_false(self, tmp_path):
+        out = tmp_path / "context"
+
+        async def scenario():
+            argv = _py("import sys; open(sys.argv[1], 'w').write(sys.argv[2])") + (
+                str(out),
+                "%deleted_data%",
+            )
+            hooks = {HookEvent.TORRENT_PURGED: (_hook(argv),)}
+            manager = DaemonManager(
+                tmp_path / "downloads", tmp_path / "state.json", generate_peer_id(), hooks=hooks
+            )
+            torrent_id = await manager.add_torrent(_no_tracker_magnet())
+            await manager.purge(torrent_id, with_data=False)
+            await manager.hook_runner.wait_idle()
+
+        _run(scenario())
+        assert out.read_text() == "false"
+
+    def test_no_hooks_configured_is_harmless(self, tmp_path):
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", tmp_path / "state.json", generate_peer_id())
+            torrent_id = await manager.add_torrent(_no_tracker_magnet())
+            await manager.purge(torrent_id)
+            await manager.hook_runner.wait_idle()
+            assert manager.list_torrents() == []
+
+        _run(scenario())
+
+
+class TestTestHook:
+    def test_runs_the_configured_commands(self, tmp_path):
+        marker = tmp_path / "ran"
+
+        async def scenario():
+            hooks = {
+                HookEvent.DOWNLOAD_COMPLETED: (_hook(_py(f"open({str(marker)!r}, 'w').write('x')")),)
+            }
+            manager = DaemonManager(
+                tmp_path / "downloads", tmp_path / "state.json", generate_peer_id(), hooks=hooks
+            )
+            torrent_id = await manager.add_torrent(_no_tracker_magnet())
+            return await manager.test_hook(HookEvent.DOWNLOAD_COMPLETED, torrent_id=torrent_id)
+
+        result = _run(scenario())
+        assert marker.exists()
+        assert result["configured"] is True
+        assert [r["outcome"] for r in result["results"]] == ["ok"]
+
+    def test_reports_the_torrent_it_ran_against(self, tmp_path):
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", tmp_path / "state.json", generate_peer_id())
+            torrent_id = await manager.add_torrent(_no_tracker_magnet(name="ubuntu.iso"))
+            return await manager.test_hook(HookEvent.DOWNLOAD_COMPLETED, torrent_id=torrent_id)
+
+        result = _run(scenario())
+        assert result["torrent_name"] == "ubuntu.iso"
+
+    def test_unconfigured_event_reports_not_configured(self, tmp_path):
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", tmp_path / "state.json", generate_peer_id())
+            torrent_id = await manager.add_torrent(_no_tracker_magnet())
+            return await manager.test_hook(HookEvent.DOWNLOAD_ERROR, torrent_id=torrent_id)
+
+        result = _run(scenario())
+        assert result["configured"] is False
+        assert result["results"] == []
+
+    def test_does_not_perform_the_real_action(self, tmp_path):
+        # Testing torrent_purged must not actually purge the torrent.
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", tmp_path / "state.json", generate_peer_id())
+            torrent_id = await manager.add_torrent(_no_tracker_magnet())
+            await manager.test_hook(HookEvent.TORRENT_PURGED, torrent_id=torrent_id)
+            assert len(manager.list_torrents()) == 1
+
+        _run(scenario())
+
+    def test_resolves_by_name(self, tmp_path):
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", tmp_path / "state.json", generate_peer_id())
+            torrent_id = await manager.add_torrent(_no_tracker_magnet(name="ubuntu.iso"))
+            result = await manager.test_hook(HookEvent.DOWNLOAD_COMPLETED, name="ubuntu.iso")
+            assert result["torrent_id"] == torrent_id
+
+        _run(scenario())
+
+    def test_name_match_is_case_insensitive(self, tmp_path):
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", tmp_path / "state.json", generate_peer_id())
+            torrent_id = await manager.add_torrent(_no_tracker_magnet(name="Ubuntu.ISO"))
+            result = await manager.test_hook(HookEvent.DOWNLOAD_COMPLETED, name="ubuntu.iso")
+            assert result["torrent_id"] == torrent_id
+
+        _run(scenario())
+
+    def test_ambiguous_name_is_rejected(self, tmp_path):
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", tmp_path / "state.json", generate_peer_id())
+            await manager.add_torrent(_no_tracker_magnet(name="dupe", hash_byte=b"\x01"))
+            await manager.add_torrent(_no_tracker_magnet(name="dupe", hash_byte=b"\x02"))
+            with pytest.raises(ValueError) as exc:
+                await manager.test_hook(HookEvent.DOWNLOAD_COMPLETED, name="dupe")
+            assert "use --id" in str(exc.value)
+
+        _run(scenario())
+
+    def test_unknown_id_is_rejected(self, tmp_path):
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", tmp_path / "state.json", generate_peer_id())
+            with pytest.raises(ValueError):
+                await manager.test_hook(HookEvent.DOWNLOAD_COMPLETED, torrent_id="zzzz")
+
+        _run(scenario())
+
+    def test_unknown_name_is_rejected(self, tmp_path):
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", tmp_path / "state.json", generate_peer_id())
+            with pytest.raises(ValueError):
+                await manager.test_hook(HookEvent.DOWNLOAD_COMPLETED, name="nope")
+
+        _run(scenario())
+
+    def test_neither_id_nor_name_is_rejected(self, tmp_path):
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", tmp_path / "state.json", generate_peer_id())
+            with pytest.raises(ValueError):
+                await manager.test_hook(HookEvent.DOWNLOAD_COMPLETED)
+
+        _run(scenario())
+
+    def test_falls_back_to_name_when_id_is_not_found(self, tmp_path):
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", tmp_path / "state.json", generate_peer_id())
+            torrent_id = await manager.add_torrent(_no_tracker_magnet(name="ubuntu.iso"))
+            result = await manager.test_hook(
+                HookEvent.DOWNLOAD_COMPLETED, torrent_id="zzzz", name="ubuntu.iso"
+            )
+            assert result["torrent_id"] == torrent_id
 
         _run(scenario())
