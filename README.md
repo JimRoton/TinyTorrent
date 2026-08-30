@@ -269,10 +269,35 @@ for a single purge. An id and `--errors` cannot be combined.
 
 ## Display
 
-`tinytorrent list` truncates long torrent names to 72 characters
-followed by `...`, so a release-scene name can't wrap the terminal and
-break the column alignment. This affects the listing only — the
-torrent's real name is unchanged, and the files on disk are unaffected.
+`tinytorrent list` tidies torrent names before showing them, so a
+release-scene name can't wrap the terminal and wreck the column
+alignment:
+
+- **Bracketed tags are removed** — `[HorribleSubs]`, `(1080p)`,
+  `[x264]`. Matched pairs only, so a stray `[` is left alone as ordinary
+  punctuation. Nested tags are unwound.
+- **Emoji and pictographs are removed** — `❤️`, `🔥`, `⭐`, flags, skin
+  tones. Ordinary typography survives: `°`, `©`, `®`, `™`.
+- **Separator debris left behind is tidied** — `S01E01.[1080p].WEB-DL`
+  becomes `S01E01.WEB-DL`, not `S01E01..WEB-DL`.
+- **What remains is truncated to 72 characters** followed by `...`.
+  Cleaning happens first, so a long tag never eats into the visible
+  budget.
+
+```
+[SubsPlease] Some Anime - 12 (1080p) [A1B2C3D4].mkv   ->  Some Anime - 12.mkv
+❤️ HOT RELEASE 🔥🔥 Movie.2026.1080p ⭐                 ->  HOT RELEASE Movie.2026.1080p
+```
+
+Letters, digits and punctuation from any script are kept — an accented
+or CJK title is text, not decoration, so `Café Society` and
+`日本語のタイトル` come through intact.
+
+All of this affects the listing only. The torrent's real name is
+unchanged, the daemon still stores and sends it in full, and the files
+on disk are unaffected. A name consisting entirely of tags and emoji
+cleans away to nothing and shows as `-`; the ID column still identifies
+the row.
 
 ## Pause & resume
 

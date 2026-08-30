@@ -157,11 +157,23 @@ It is deliberately scoped to the error state rather than being a general `--stat
 
 The ids are collected before any removal begins, since each purge mutates the scheduler's torrent list. Each removal then goes through the same path as a single purge, so `torrent_purged` fires once per torrent and `--with-data` behaves identically.
 
-## Display truncation
+## Display cleaning
 
-`list` truncates a torrent's displayed name to 72 characters plus an ellipsis. Torrent names frequently run past 100 characters, which wraps the terminal and destroys the column alignment that makes the listing readable.
+`list` cleans a torrent's displayed name in three stages — bracketed tags removed, pictographs removed, then truncation to 72 characters plus an ellipsis. Torrent names frequently run past 100 characters and carry a payload of release-group tags and emoji, which wraps the terminal and destroys the column alignment that makes the listing readable.
 
-This is strictly a presentation concern, applied in the CLI's formatting layer. The daemon still sends the full name over IPC, the session's name is unchanged, and nothing about the files on disk is affected. The ellipsis is appended rather than the name being silently cut, so it is obvious that a name has been shortened.
+**Bracketed tags** (`[...]`, `(...)`) are matched-pair only, so an unmatched bracket stays as ordinary punctuation rather than swallowing the rest of the name. Nesting is unwound by re-applying the match a bounded number of times, rather than by a recursive pattern.
+
+**Pictographs** are identified by Unicode category rather than a hand-maintained list of ranges: emoji are category `So`, with `Sk` skin-tone modifiers, `Me` enclosing keycaps, and the `Cf`/`Mn` joiners and variation selectors that glue sequences together. A short allowlist keeps the category-`So` characters that are ordinary typography rather than pictures — `°`, `©`, `®`, `™`.
+
+The rule is deliberately a blocklist of pictographs rather than an allowlist of ASCII. Restricting the display to ASCII would mangle legitimate titles — accented Latin, Cyrillic, CJK — which are text, not decoration. The goal is removing pictures, not transliterating the world.
+
+Removing a tag from between separators leaves debris: `S01E01.[1080p].WEB-DL` would collapse to `S01E01..WEB-DL`. Repeated dots and spaces before punctuation are tidied, and leading or trailing separators trimmed, since that fallout is created by the removal rather than present in the original.
+
+Truncation runs last, so the 72-character budget applies to what is actually shown and a long tag never consumes part of it.
+
+A name made up entirely of tags and emoji cleans away to nothing and renders as `-`. The ID column still identifies the row, and showing the original would defeat the point of the cleaning.
+
+All of this is strictly a presentation concern, applied in the CLI's formatting layer. The daemon still sends the full name over IPC, the session's name is unchanged, and nothing about the files on disk is affected. The ellipsis is appended rather than the name being silently cut, so it is obvious that a name has been shortened.
 
 ## Explicitly Out of Scope (v1)
 

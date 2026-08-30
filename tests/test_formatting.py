@@ -337,3 +337,114 @@ class TestTorrentTableNameTruncation:
     def test_no_row_exceeds_the_display_limit_for_its_name(self):
         text = format_torrent_table([_torrent("D" * 400)])
         assert "D" * (NAME_DISPLAY_LIMIT + 1) not in text
+
+
+class TestFormatNameBracketRemoval:
+    def test_removes_a_square_bracket_tag(self):
+        assert format_name("[HorribleSubs] Some Show") == "Some Show"
+
+    def test_removes_a_round_bracket_tag(self):
+        assert format_name("Ubuntu 24.04 (Noble Numbat) Desktop") == "Ubuntu 24.04 Desktop"
+
+    def test_removes_several_tags(self):
+        assert format_name("Cafe Society (2016) [BluRay] [x264] Movie") == "Cafe Society Movie"
+
+    def test_removes_trailing_tags_entirely(self):
+        assert format_name("Cafe Society (2016) [BluRay]") == "Cafe Society"
+
+    def test_unwinds_nested_brackets(self):
+        assert format_name("Nested [outer [inner] tag] Title") == "Nested Title"
+
+    def test_leaves_an_unmatched_bracket_alone(self):
+        assert format_name("Unmatched [bracket here") == "Unmatched [bracket here"
+
+    def test_leaves_an_unmatched_paren_alone(self):
+        assert format_name("Unmatched (paren here") == "Unmatched (paren here"
+
+    def test_empty_brackets(self):
+        assert format_name("Title [] ()") == "Title"
+
+    def test_a_name_that_is_only_a_tag(self):
+        assert format_name("[only-a-tag]") == "-"
+
+    def test_collapses_whitespace_left_behind(self):
+        assert format_name("A [x] [y] B") == "A B"
+
+    def test_tidies_doubled_separators(self):
+        assert format_name("Show.Name.S01E01.[1080p].WEB-DL.mkv") == "Show.Name.S01E01.WEB-DL.mkv"
+
+    def test_tidies_space_before_extension(self):
+        assert format_name("[Group] Some Show - 01 [1080p].mkv") == "Some Show - 01.mkv"
+
+    def test_does_not_strip_brackets_from_the_real_name(self):
+        # format_name returns a new string; nothing mutates the input.
+        original = "[Group] Title"
+        format_name(original)
+        assert original == "[Group] Title"
+
+
+class TestFormatNamePictographRemoval:
+    def test_removes_an_emoji_with_variation_selector(self):
+        assert format_name("❤️ Movie") == "Movie"
+
+    def test_removes_supplementary_plane_emoji(self):
+        assert format_name("HOT \U0001F525\U0001F525 Movie") == "HOT Movie"
+
+    def test_removes_a_star(self):
+        assert format_name("Movie ⭐") == "Movie"
+
+    def test_removes_a_check_mark(self):
+        assert format_name("✅ Verified Movie") == "Verified Movie"
+
+    def test_removes_flag_regional_indicators(self):
+        assert format_name("\U0001F1FA\U0001F1F8 Movie") == "Movie"
+
+    def test_removes_skin_tone_modifiers(self):
+        assert format_name("\U0001F44D\U0001F3FB Movie") == "Movie"
+
+    def test_removes_zero_width_joiner_sequences(self):
+        assert format_name("\U0001F468‍\U0001F4BB Movie") == "Movie"
+
+    def test_a_name_that_is_only_emoji(self):
+        assert format_name("\U0001F525\U0001F525\U0001F525") == "-"
+
+    def test_keeps_ordinary_typographic_symbols(self):
+        assert format_name("Temp 25° © Studio™") == "Temp 25° © Studio™"
+
+    def test_keeps_accented_latin(self):
+        assert format_name("Café Society") == "Café Society"
+
+    def test_keeps_cjk_titles(self):
+        assert format_name("日本語のタイトル [RAW]") == "日本語のタイトル"
+
+    def test_keeps_maths_symbols_and_dashes(self):
+        assert format_name("A ± B × C — D") == "A ± B × C — D"
+
+    def test_keeps_ascii_punctuation(self):
+        name = "Show_Name-2026 (S01) v2.0 #1 @home"
+        assert format_name(name) == "Show_Name-2026 v2.0 #1 @home"
+
+    def test_keeps_caret_which_is_a_modifier_symbol(self):
+        assert format_name("Two^Three") == "Two^Three"
+
+
+class TestFormatNameCombined:
+    def test_cleaning_then_truncation_uses_the_cleaned_length(self):
+        # 80 real characters plus a tag: the tag goes, then the remainder
+        # is truncated -- so the tag never eats into the visible budget.
+        name = "A" * 80 + " [1080p]"
+        assert format_name(name) == "A" * NAME_DISPLAY_LIMIT + "..."
+
+    def test_a_name_under_the_limit_only_after_cleaning_is_not_truncated(self):
+        name = "B" * 70 + " [some-very-long-release-group-tag]"
+        assert format_name(name) == "B" * 70
+
+    def test_realistic_release_name(self):
+        name = "[SubsPlease] Some Anime - 12 (1080p) [A1B2C3D4].mkv"
+        assert format_name(name) == "Some Anime - 12.mkv"
+
+    def test_table_shows_the_cleaned_name(self):
+        text = format_torrent_table([_torrent("[Group] \U0001F525 Real Title (1080p).mkv")])
+        assert "Real Title.mkv" in text
+        assert "[Group]" not in text
+        assert "\U0001F525" not in text

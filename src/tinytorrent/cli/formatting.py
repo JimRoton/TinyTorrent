@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from typing import Any
 
 _BYTE_UNITS = ["B", "KB", "MB", "GB", "TB", "PB"]
@@ -12,6 +14,49 @@ _BYTE_UNITS = ["B", "KB", "MB", "GB", "TB", "PB"]
 # disk and every other command are unaffected.
 NAME_DISPLAY_LIMIT = 72
 _ELLIPSIS = "..."
+
+# Bracketed tags -- [HorribleSubs], (1080p) -- are release-group and
+# encoding noise that pushes the actual title off the row. Matched pairs
+# only; a stray unmatched bracket is left alone as ordinary punctuation.
+_BRACKETED_RE = re.compile(r"\[[^\[\]]*\]|\([^()]*\)")
+_WHITESPACE_RE = re.compile(r"\s+")
+# Removing a tag from between separators leaves debris behind:
+# "S01E01.[1080p].WEB-DL" collapses to "S01E01..WEB-DL", and
+# "Show - 01 [x].mkv" to "Show - 01 .mkv". These tidy that fallout.
+_REPEATED_DOTS_RE = re.compile(r"\.{2,}")
+_SPACE_BEFORE_PUNCTUATION_RE = re.compile(r"\s+([.,])")
+_EDGE_SEPARATORS = " .-_"
+_MAX_BRACKET_PASSES = 5  # enough to unwind nesting without looping forever
+
+# Emoji and pictographs are Unicode category So (plus Sk skin-tone
+# modifiers, Me enclosing keycaps, and the Cf/Mn joiners that glue
+# sequences together). A handful of category-So characters are ordinary
+# typography rather than pictures, so they are kept.
+_KEPT_SYMBOLS = frozenset("\u00b0\u00a9\u00ae\u2122")
+_DROPPED_CATEGORIES = frozenset({"So", "Me", "Cf", "Cc", "Cs", "Co"})
+_VARIATION_SELECTORS = range(0xFE00, 0xFE10)
+_PICTOGRAPH_PLANE = range(0x1F000, 0x1FB00)  # emoji, skin tones, flags
+
+
+def _is_pictograph(ch: str) -> bool:
+    """True for emoji-like characters that shouldn't reach the terminal."""
+    if ch.isspace():
+        return False  # handled by whitespace collapsing, not deletion
+    if ch in _KEPT_SYMBOLS:
+        return False
+    codepoint = ord(ch)
+    if codepoint in _PICTOGRAPH_PLANE or codepoint in _VARIATION_SELECTORS:
+        return True
+    return unicodedata.category(ch) in _DROPPED_CATEGORIES
+
+
+def _strip_bracketed(name: str) -> str:
+    for _ in range(_MAX_BRACKET_PASSES):
+        stripped = _BRACKETED_RE.sub("", name)
+        if stripped == name:
+            break
+        name = stripped
+    return name
 
 
 def format_bytes(n: "int | None") -> str:
@@ -55,17 +100,36 @@ def format_progress(bytes_downloaded: "int | None", total_length: "int | None") 
 
 
 def format_name(name: "str | None") -> str:
-    """Shorten a torrent name for display only.
+    """Clean up a torrent name for display only.
 
-    Names longer than ``NAME_DISPLAY_LIMIT`` are cut to that many
-    characters with an ellipsis appended, so the truncation is visible
-    rather than silently losing the tail.
+    Bracketed tags are dropped, emoji and other pictographs are removed,
+    runs of whitespace are collapsed, the separator debris a removed tag
+    leaves behind is tidied up, and what's left is cut to
+    ``NAME_DISPLAY_LIMIT`` characters with an ellipsis appended so the
+    truncation is visible rather than silently losing the tail.
+
+    Letters, digits and punctuation from any script survive -- an
+    accented or CJK title is text, not decoration. Truncation happens
+    last, so the limit applies to what is actually shown. None of this
+    touches the torrent's real name or the files on disk.
     """
     if not name:
         return "-"
-    if len(name) <= NAME_DISPLAY_LIMIT:
-        return name
-    return name[:NAME_DISPLAY_LIMIT] + _ELLIPSIS
+
+    cleaned = _strip_bracketed(name)
+    cleaned = "".join(ch for ch in cleaned if not _is_pictograph(ch))
+    cleaned = _WHITESPACE_RE.sub(" ", cleaned)
+    cleaned = _REPEATED_DOTS_RE.sub(".", cleaned)
+    cleaned = _SPACE_BEFORE_PUNCTUATION_RE.sub(r"\1", cleaned)
+    cleaned = cleaned.strip(_EDGE_SEPARATORS)
+
+    # A name made up entirely of tags and emoji cleans away to nothing;
+    # the ID column still identifies the row.
+    if not cleaned:
+        return "-"
+    if len(cleaned) <= NAME_DISPLAY_LIMIT:
+        return cleaned
+    return cleaned[:NAME_DISPLAY_LIMIT] + _ELLIPSIS
 
 
 def format_torrent_table(torrents: "list[dict[str, Any]]") -> str:
