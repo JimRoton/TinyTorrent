@@ -1,5 +1,6 @@
 from tinytorrent.cli.formatting import (
     NAME_DISPLAY_LIMIT,
+    display_width,
     format_bytes,
     format_eta,
     format_hook_test_results,
@@ -109,8 +110,14 @@ class TestFormatTorrentTable:
             ]
         )
         lines = table.splitlines()
-        # Header and both rows should be the same length once padded.
-        assert len(lines[0]) == len(lines[1]) == len(lines[2])
+        # Each column starts at the same offset on every line. Total line
+        # lengths differ, because the final column is deliberately left
+        # unpadded rather than trailing spaces onto every row.
+        for column in ("STATUS", "PRIORITY", "PROGRESS", "SPEED", "ETA"):
+            header_offset = lines[0].index(column)
+            for line in lines[1:]:
+                assert len(line) > header_offset
+                assert line[header_offset - 1] == " "
 
 
 def _result(
@@ -448,3 +455,135 @@ class TestFormatNameCombined:
         assert "Real Title.mkv" in text
         assert "[Group]" not in text
         assert "\U0001F525" not in text
+
+
+class TestDisplayWidth:
+    def test_ascii_is_one_column_each(self):
+        assert display_width("Ubuntu") == 6
+
+    def test_empty_string(self):
+        assert display_width("") == 0
+
+    def test_cjk_is_two_columns_each(self):
+        assert display_width("日本語") == 6
+
+    def test_hangul_is_two_columns_each(self):
+        assert display_width("한국어") == 6
+
+    def test_fullwidth_latin_is_two_columns_each(self):
+        assert display_width("ＡＢ") == 4
+
+    def test_halfwidth_katakana_is_one_column(self):
+        assert display_width("ｱｲｳ") == 3
+
+    def test_cyrillic_is_narrow(self):
+        assert display_width("Здравствуй") == 10
+
+    def test_accented_latin_is_narrow(self):
+        assert display_width("Café") == 4
+
+    def test_combining_marks_take_no_room(self):
+        # "e" + combining acute renders as one column, not two.
+        assert display_width("é") == 1
+
+    def test_composed_and_decomposed_forms_agree(self):
+        assert display_width("é") == display_width("é")
+
+    def test_zero_width_joiner_takes_no_room(self):
+        assert display_width("a‍b") == 2
+
+    def test_mixed_script(self):
+        assert display_width("A日B") == 4
+
+
+class TestTableAlignment:
+    def _table(self, names):
+        return format_torrent_table(
+            [
+                {
+                    "id": f"row{i}",
+                    "name": name,
+                    "status": "error",
+                    "priority": "normal",
+                    "bytes_downloaded": 0,
+                    "total_length": 10,
+                }
+                for i, name in enumerate(names)
+            ]
+        )
+
+    def test_status_column_starts_at_one_offset_for_cjk_rows(self):
+        text = self._table(["Ubuntu.24.04.iso", "日本語のタイトル", "Café Society"])
+        offsets = {display_width(line[: line.index("error")]) for line in text.splitlines()[1:]}
+        assert len(offsets) == 1
+
+    def test_header_aligns_with_the_rows(self):
+        text = self._table(["日本語のタイトル"])
+        header, row = text.splitlines()
+        assert display_width(header[: header.index("STATUS")]) == display_width(
+            row[: row.index("error")]
+        )
+
+    def test_hangul_rows_align(self):
+        text = self._table(["한국어 제목", "plain-name"])
+        offsets = {display_width(line[: line.index("error")]) for line in text.splitlines()[1:]}
+        assert len(offsets) == 1
+
+    def test_fullwidth_rows_align(self):
+        text = self._table(["ＦＵＬＬＷＩＤＴＨ", "plain"])
+        offsets = {display_width(line[: line.index("error")]) for line in text.splitlines()[1:]}
+        assert len(offsets) == 1
+
+    def test_no_trailing_whitespace_on_any_line(self):
+        text = self._table(["日本語", "plain-name"])
+        assert all(line == line.rstrip() for line in text.splitlines())
+
+    def test_header_has_no_trailing_whitespace(self):
+        text = self._table(["x"])
+        assert text.splitlines()[0].endswith("ETA")
+
+    def test_columns_are_separated_by_two_spaces(self):
+        text = self._table(["ab"])
+        assert "row0  ab" in text
+
+
+class TestWidthBasedTruncation:
+    def test_cjk_name_is_truncated_by_columns_not_characters(self):
+        name = "日" * 60  # 120 columns
+        out = format_name(name)
+        assert out.endswith("...")
+        assert display_width(out) == NAME_DISPLAY_LIMIT + 3
+
+    def test_cjk_name_exactly_at_the_limit_is_kept(self):
+        name = "日" * (NAME_DISPLAY_LIMIT // 2)
+        assert format_name(name) == name
+
+    def test_one_column_over_is_truncated(self):
+        name = "日" * (NAME_DISPLAY_LIMIT // 2) + "X"
+        assert format_name(name).endswith("...")
+
+    def test_a_wide_character_straddling_the_limit_is_dropped(self):
+        # 71 narrow + one wide: the wide char would occupy columns 72-73,
+        # so it is dropped rather than half-printed.
+        name = "A" * 71 + "日" + "B" * 10
+        out = format_name(name)
+        assert display_width(out) <= NAME_DISPLAY_LIMIT + 3
+        assert "日" not in out
+
+    def test_mixed_script_name_respects_the_column_budget(self):
+        out = format_name("日本語" * 10 + "X" * 40)
+        assert display_width(out) == NAME_DISPLAY_LIMIT + 3
+
+    def test_ascii_truncation_is_unchanged(self):
+        assert format_name("A" * 100) == "A" * NAME_DISPLAY_LIMIT + "..."
+
+
+class TestUnicodeNormalisation:
+    def test_decomposed_name_is_composed_for_display(self):
+        assert format_name("Café Society") == "Café Society"
+
+    def test_composed_and_decomposed_render_identically(self):
+        assert format_name("Café Society") == format_name("Café Society")
+
+    def test_normalised_name_measures_as_narrow(self):
+        assert display_width(format_name("Café Society")) == 12

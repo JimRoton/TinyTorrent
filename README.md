@@ -280,9 +280,9 @@ alignment:
   tones. Ordinary typography survives: `°`, `©`, `®`, `™`.
 - **Separator debris left behind is tidied** — `S01E01.[1080p].WEB-DL`
   becomes `S01E01.WEB-DL`, not `S01E01..WEB-DL`.
-- **What remains is truncated to 72 characters** followed by `...`.
-  Cleaning happens first, so a long tag never eats into the visible
-  budget.
+- **What remains is truncated to 72 terminal columns** followed by
+  `...`. Cleaning happens first, so a long tag never eats into the
+  visible budget.
 
 ```
 [SubsPlease] Some Anime - 12 (1080p) [A1B2C3D4].mkv   ->  Some Anime - 12.mkv
@@ -292,6 +292,15 @@ alignment:
 Letters, digits and punctuation from any script are kept — an accented
 or CJK title is text, not decoration, so `Café Society` and
 `日本語のタイトル` come through intact.
+
+Columns are aligned in **terminal columns, not characters**. A CJK
+character occupies two columns while Python counts it as one, so naive
+padding leaves a Japanese title short and shoves every following column
+out of line. Widths are measured the way POSIX `wcswidth` does — wide
+East Asian characters count two, combining marks count zero — which also
+means a CJK title shows fewer characters than a Latin one for the same
+72-column budget, because it genuinely takes twice the room. The final
+column is left unpadded, so no row ends in trailing spaces.
 
 All of this affects the listing only. The torrent's real name is
 unchanged, the daemon still stores and sends it in full, and the files

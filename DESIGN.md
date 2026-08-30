@@ -169,7 +169,23 @@ The rule is deliberately a blocklist of pictographs rather than an allowlist of 
 
 Removing a tag from between separators leaves debris: `S01E01.[1080p].WEB-DL` would collapse to `S01E01..WEB-DL`. Repeated dots and spaces before punctuation are tidied, and leading or trailing separators trimmed, since that fallout is created by the removal rather than present in the original.
 
-Truncation runs last, so the 72-character budget applies to what is actually shown and a long tag never consumes part of it.
+Truncation runs last, so the 72-column budget applies to what is actually shown and a long tag never consumes part of it.
+
+### Column alignment
+
+Alignment is computed in terminal columns rather than codepoints. `str.ljust` counts characters, but a terminal allocates columns, and an East Asian character occupies two of them — so a Japanese title padded by `len()` comes up short and pushes every column after it out of line.
+
+The standard for this is Unicode Standard Annex #11 (East Asian Width) as exposed by POSIX `wcwidth`/`wcswidth`: wide and fullwidth characters count two, combining marks and zero-width joiners count zero, everything else counts one. The canonical Python implementation is the `wcwidth` package, which is not used here — the project declares no dependencies, and `unicodedata` already exposes the East Asian Width property directly, so the needed subset is a short in-tree helper.
+
+Ambiguous-width characters count as one. Terminals genuinely disagree about them — a CJK-locale terminal renders them wide — and resolving that correctly would require interrogating the terminal's locale, which is beyond what a list command should be doing. POSIX `wcwidth` makes the same choice.
+
+Names are normalised to NFC before measuring, since an accented letter may arrive either composed or as a base plus a combining mark, and only the composed form measures predictably.
+
+Truncation is by column too. Otherwise a 72-*character* CJK name still occupies 144 columns and defeats the point. A wide character that would straddle the limit is dropped rather than half-printed. The visible consequence is that a CJK title shows fewer characters than a Latin one — correct, since it genuinely takes twice the space per character.
+
+The final column is not padded. Padding it only appends trailing spaces to every line, which dirties copy-paste and diffs without changing what the user sees.
+
+No in-process calculation can be perfect here: terminals vary in how they render emoji and parts of the ambiguous ranges, and nothing can query the terminal for its actual behaviour. This gets the common cases right rather than every case — and since emoji are already stripped from displayed names, the main remaining source of disagreement is gone.
 
 A name made up entirely of tags and emoji cleans away to nothing and renders as `-`. The ID column still identifies the row, and showing the original would defeat the point of the cleaning.
 

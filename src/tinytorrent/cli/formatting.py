@@ -1,4 +1,10 @@
-"""Plain-text formatting for `tinytorrent list` output (no JSON mode, by design)."""
+"""Plain-text formatting for `tinytorrent list` output (no JSON mode, by design).
+
+Column alignment is done in terminal *columns*, not codepoints: a CJK
+character occupies two columns while ``len()`` counts it as one, so
+padding with ``str.ljust`` would leave a Japanese title several columns
+short and shove every following column out of line.
+"""
 
 from __future__ import annotations
 
@@ -12,8 +18,56 @@ _BYTE_UNITS = ["B", "KB", "MB", "GB", "TB", "PB"]
 # terminal and wreck the column alignment. Only the display is
 # shortened -- the torrent's real name is untouched, so the files on
 # disk and every other command are unaffected.
+# Measured in terminal columns rather than characters, so a CJK title
+# takes the same room on screen as a Latin one of the same width.
 NAME_DISPLAY_LIMIT = 72
 _ELLIPSIS = "..."
+
+# Unicode Standard Annex #11 East Asian Width: 'W' (wide) and 'F'
+# (fullwidth) occupy two terminal columns. 'A' (ambiguous) is rendered
+# wide only by CJK-locale terminals; POSIX wcwidth treats it as narrow
+# and so do we, since we can't interrogate the terminal.
+_WIDE_EAST_ASIAN = frozenset({"W", "F"})
+_ZERO_WIDTH_CATEGORIES = frozenset({"Mn", "Me", "Cf"})
+
+
+def display_width(text: str) -> int:
+    """How many terminal columns ``text`` occupies.
+
+    The stdlib-only equivalent of POSIX ``wcswidth``: combining marks
+    take no room, East Asian wide characters take two, everything else
+    takes one. Keeping this in-tree avoids a dependency on ``wcwidth``
+    for what amounts to a lookup ``unicodedata`` already provides.
+    """
+    width = 0
+    for ch in text:
+        if unicodedata.combining(ch) or unicodedata.category(ch) in _ZERO_WIDTH_CATEGORIES:
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in _WIDE_EAST_ASIAN else 1
+    return width
+
+
+def _truncate_to_width(text: str, limit: int) -> str:
+    """Cut ``text`` to at most ``limit`` columns.
+
+    A wide character that would straddle the limit is dropped rather
+    than half-printed, and zero-width marks stay attached to the
+    character they modify.
+    """
+    width = 0
+    for index, ch in enumerate(text):
+        ch_width = 0 if (
+            unicodedata.combining(ch) or unicodedata.category(ch) in _ZERO_WIDTH_CATEGORIES
+        ) else (2 if unicodedata.east_asian_width(ch) in _WIDE_EAST_ASIAN else 1)
+        if width + ch_width > limit:
+            return text[:index]
+        width += ch_width
+    return text
+
+
+def _pad(text: str, width: int) -> str:
+    """Left-align ``text`` in a field ``width`` columns wide."""
+    return text + " " * max(0, width - display_width(text))
 
 # Bracketed tags -- [HorribleSubs], (1080p) -- are release-group and
 # encoding noise that pushes the actual title off the row. Matched pairs
@@ -116,7 +170,11 @@ def format_name(name: "str | None") -> str:
     if not name:
         return "-"
 
-    cleaned = _strip_bracketed(name)
+    # Normalising first makes width deterministic: an accented letter can
+    # arrive either as one codepoint or as a base plus a combining mark,
+    # and only the composed form measures predictably.
+    cleaned = unicodedata.normalize("NFC", name)
+    cleaned = _strip_bracketed(cleaned)
     cleaned = "".join(ch for ch in cleaned if not _is_pictograph(ch))
     cleaned = _WHITESPACE_RE.sub(" ", cleaned)
     cleaned = _REPEATED_DOTS_RE.sub(".", cleaned)
@@ -127,9 +185,9 @@ def format_name(name: "str | None") -> str:
     # the ID column still identifies the row.
     if not cleaned:
         return "-"
-    if len(cleaned) <= NAME_DISPLAY_LIMIT:
+    if display_width(cleaned) <= NAME_DISPLAY_LIMIT:
         return cleaned
-    return cleaned[:NAME_DISPLAY_LIMIT] + _ELLIPSIS
+    return _truncate_to_width(cleaned, NAME_DISPLAY_LIMIT) + _ELLIPSIS
 
 
 def format_torrent_table(torrents: "list[dict[str, Any]]") -> str:
@@ -151,11 +209,18 @@ def format_torrent_table(torrents: "list[dict[str, Any]]") -> str:
     ]
 
     widths = [
-        max(len(headers[i]), *(len(str(row[i])) for row in rows)) for i in range(len(headers))
+        max(display_width(headers[i]), *(display_width(str(row[i])) for row in rows))
+        for i in range(len(headers))
     ]
-    lines = ["  ".join(h.ljust(w) for h, w in zip(headers, widths))]
-    lines += ["  ".join(str(c).ljust(w) for c, w in zip(row, widths)) for row in rows]
-    return "\n".join(lines)
+    return "\n".join(_format_row(row, widths) for row in [headers, *rows])
+
+
+def _format_row(cells: "list[Any]", widths: "list[int]") -> str:
+    # The final column is left unpadded -- padding it only appends
+    # trailing spaces to every line, which dirties copy-paste and diffs.
+    padded = [_pad(str(cell), width) for cell, width in zip(cells[:-1], widths[:-1])]
+    padded.append(str(cells[-1]))
+    return "  ".join(padded)
 
 
 def _format_interval(seconds: float) -> str:
