@@ -12,6 +12,11 @@ ExecStart=%h/.local/bin/tinytorrentd
 Restart=on-failure
 RestartSec=5
 
+# If you configure `daemon_stopping` hooks, remember that tinytorrentd
+# waits for them during shutdown -- systemd will SIGKILL the daemon once
+# TimeoutStopSec (90s by default) elapses, so keep stop hooks short or
+# raise the timeout here.
+
 # All daemon settings (download directory, state file, socket path,
 # max concurrent downloads) come from ~/.config/tinytorrent/config.json,
 # or TinyTorrent's built-in defaults if that file doesn't exist -- see

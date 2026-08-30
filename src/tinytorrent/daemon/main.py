@@ -66,12 +66,18 @@ async def _run(config: Config) -> None:
         peer_id,
         max_active=config.max_active,
         hooks=config.hooks,
+        socket_path=config.socket_path,
     )
     await manager.load_from_disk()
 
     server = IPCServer(manager, config.socket_path)
     await server.start()
     logger.info("tinytorrentd listening on %s", config.socket_path)
+
+    # Fired only once the socket is up, so a hook may shell out to the
+    # `tinytorrent` CLI. This also starts any repeating (interval_seconds)
+    # commands the event configures.
+    manager.fire_daemon_started()
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()

@@ -1,7 +1,10 @@
 import pytest
 
 from tinytorrent.common.hooks import (
+    DAEMON_EVENTS,
     DEFAULT_TIMEOUT_SECONDS,
+    INTERVAL_EVENTS,
+    MIN_INTERVAL_SECONDS,
     HookCommand,
     HookConfigError,
     HookEvent,
@@ -18,6 +21,8 @@ class TestHookEvent:
             "download_completed",
             "download_error",
             "torrent_purged",
+            "daemon_started",
+            "daemon_stopping",
         }
 
     def test_lookup_by_value(self):
@@ -176,3 +181,115 @@ class TestSubstituteArgv:
 
     def test_returns_a_list_not_a_tuple(self):
         assert isinstance(substitute_argv(("x",), {}), list)
+
+
+class TestEventGroupings:
+    def test_daemon_events(self):
+        assert DAEMON_EVENTS == {HookEvent.DAEMON_STARTED, HookEvent.DAEMON_STOPPING}
+
+    def test_only_daemon_started_may_repeat(self):
+        assert INTERVAL_EVENTS == {HookEvent.DAEMON_STARTED}
+
+    def test_interval_events_are_a_subset_of_daemon_events(self):
+        assert INTERVAL_EVENTS <= DAEMON_EVENTS
+
+
+class TestIntervalSeconds:
+    def test_absent_by_default(self):
+        parsed = parse_hooks_config({"daemon_started": [{"command": ["x"]}]})
+        command = parsed[HookEvent.DAEMON_STARTED][0]
+        assert command.interval_seconds is None
+        assert command.repeats is False
+
+    def test_parsed_when_present(self):
+        parsed = parse_hooks_config({"daemon_started": [{"command": ["x"], "interval_seconds": 60}]})
+        command = parsed[HookEvent.DAEMON_STARTED][0]
+        assert command.interval_seconds == 60.0
+        assert command.repeats is True
+
+    def test_accepts_a_float(self):
+        parsed = parse_hooks_config({"daemon_started": [{"command": ["x"], "interval_seconds": 1.5}]})
+        assert parsed[HookEvent.DAEMON_STARTED][0].interval_seconds == 1.5
+
+    def test_accepts_exactly_the_minimum(self):
+        parsed = parse_hooks_config(
+            {"daemon_started": [{"command": ["x"], "interval_seconds": MIN_INTERVAL_SECONDS}]}
+        )
+        assert parsed[HookEvent.DAEMON_STARTED][0].interval_seconds == MIN_INTERVAL_SECONDS
+
+    def test_below_the_minimum_rejected(self):
+        with pytest.raises(HookConfigError) as exc:
+            parse_hooks_config({"daemon_started": [{"command": ["x"], "interval_seconds": 0.01}]})
+        assert "at least" in str(exc.value)
+
+    def test_zero_rejected(self):
+        with pytest.raises(HookConfigError):
+            parse_hooks_config({"daemon_started": [{"command": ["x"], "interval_seconds": 0}]})
+
+    def test_negative_rejected(self):
+        with pytest.raises(HookConfigError):
+            parse_hooks_config({"daemon_started": [{"command": ["x"], "interval_seconds": -60}]})
+
+    def test_non_numeric_rejected(self):
+        with pytest.raises(HookConfigError):
+            parse_hooks_config({"daemon_started": [{"command": ["x"], "interval_seconds": "often"}]})
+
+    @pytest.mark.parametrize(
+        "event",
+        [
+            "metadata_fetched",
+            "download_started",
+            "download_completed",
+            "download_error",
+            "torrent_purged",
+            "daemon_stopping",
+        ],
+    )
+    def test_rejected_on_every_event_that_cannot_repeat(self, event):
+        with pytest.raises(HookConfigError) as exc:
+            parse_hooks_config({event: [{"command": ["x"], "interval_seconds": 60}]})
+        assert "interval_seconds" in str(exc.value)
+        assert "daemon_started" in str(exc.value)
+
+    def test_mixed_repeating_and_one_shot_commands(self):
+        parsed = parse_hooks_config(
+            {
+                "daemon_started": [
+                    {"command": ["announce"]},
+                    {"command": ["ping"], "interval_seconds": 60},
+                    {"command": ["cleanup"], "interval_seconds": 3600},
+                ]
+            }
+        )
+        commands = parsed[HookEvent.DAEMON_STARTED]
+        assert [c.repeats for c in commands] == [False, True, True]
+        assert [c.interval_seconds for c in commands] == [None, 60.0, 3600.0]
+
+    def test_unknown_key_still_rejected_alongside_interval(self):
+        with pytest.raises(HookConfigError) as exc:
+            parse_hooks_config(
+                {"daemon_started": [{"command": ["x"], "interval_seconds": 60, "jitter": 5}]}
+            )
+        assert "jitter" in str(exc.value)
+
+
+class TestDaemonEventConfig:
+    def test_daemon_started_parses(self):
+        parsed = parse_hooks_config({"daemon_started": [{"command": ["mount.sh"]}]})
+        assert parsed[HookEvent.DAEMON_STARTED][0].argv == ("mount.sh",)
+
+    def test_daemon_stopping_parses(self):
+        parsed = parse_hooks_config({"daemon_stopping": [{"command": ["unmount.sh"]}]})
+        assert parsed[HookEvent.DAEMON_STOPPING][0].argv == ("unmount.sh",)
+
+    def test_daemon_events_honour_on_failure_and_timeout(self):
+        parsed = parse_hooks_config(
+            {
+                "daemon_stopping": [
+                    {"command": ["x"], "on_failure": "abort_remaining", "timeout_seconds": 5}
+                ]
+            }
+        )
+        command = parsed[HookEvent.DAEMON_STOPPING][0]
+        assert command.on_failure == "abort_remaining"
+        assert command.timeout_seconds == 5.0

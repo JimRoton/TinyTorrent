@@ -73,6 +73,17 @@ def format_torrent_table(torrents: "list[dict[str, Any]]") -> str:
     return "\n".join(lines)
 
 
+def _format_interval(seconds: float) -> str:
+    total = int(seconds)
+    if total < 60:
+        return f"{total}s"
+    minutes, s = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m{s:02d}s" if s else f"{minutes}m"
+    hours, m = divmod(minutes, 60)
+    return f"{hours}h{m:02d}m" if m else f"{hours}h"
+
+
 _OUTCOME_LABELS = {
     "ok": "ok",
     "failed": "FAILED",
@@ -81,9 +92,21 @@ _OUTCOME_LABELS = {
 }
 
 
-def format_hook_test_results(event: str, torrent_id: str, torrent_name: str, response: "dict[str, Any]") -> str:
-    """Format the result of `tinytorrent test` for display."""
-    header = f"Testing event '{event}' against torrent {torrent_id} ({torrent_name})"
+def format_hook_test_results(
+    event: str,
+    torrent_id: "str | None",
+    torrent_name: "str | None",
+    response: "dict[str, Any]",
+) -> str:
+    """Format the result of `tinytorrent test` for display.
+
+    ``torrent_id``/``torrent_name`` are None for the daemon-wide events,
+    which have no torrent to run against.
+    """
+    if torrent_id is None:
+        header = f"Testing event '{event}' (daemon-wide; no torrent involved)"
+    else:
+        header = f"Testing event '{event}' against torrent {torrent_id} ({torrent_name})"
 
     if not response.get("configured", False):
         return f"{header}\n\nNo hooks configured for event '{event}'. Nothing to run."
@@ -97,6 +120,12 @@ def format_hook_test_results(event: str, torrent_id: str, torrent_name: str, res
         detail = f" (exit {result['returncode']})" if result.get("returncode") is not None else ""
         lines.append(f"[{i}/{total}] {argv_display}")
         lines.append(f"        result: {outcome_label}{detail}")
+        interval = result.get("interval_seconds")
+        if interval:
+            lines.append(
+                f"        repeats: every {_format_interval(interval)} after each run finishes "
+                "(run once here)"
+            )
         if not result.get("would_run_in_production", True):
             lines.append(
                 "        note: would NOT have run in production "

@@ -118,6 +118,7 @@ def _result(
     output="",
     on_failure="ignore",
     would_run_in_production=True,
+    interval_seconds=None,
 ):
     return {
         "argv": list(argv),
@@ -125,6 +126,7 @@ def _result(
         "returncode": returncode,
         "output": output,
         "on_failure": on_failure,
+        "interval_seconds": interval_seconds,
         "would_run_in_production": would_run_in_production,
     }
 
@@ -232,3 +234,34 @@ class TestFormatHookTestResults:
         text = format_hook_test_results("download_completed", "a3f9", "demo", _response([_result()]))
         assert text.endswith("\n")
         assert not text.endswith("\n\n")
+
+
+class TestFormatHookTestResultsForDaemonEvents:
+    def test_header_when_there_is_no_torrent(self):
+        text = format_hook_test_results("daemon_started", None, None, _response([_result()]))
+        assert "daemon-wide" in text
+        assert "against torrent" not in text
+
+    def test_no_hooks_configured_without_a_torrent(self):
+        text = format_hook_test_results(
+            "daemon_stopping", None, None, _response([], configured=False)
+        )
+        assert "No hooks configured" in text
+
+    def test_shows_the_repeat_cadence(self):
+        text = format_hook_test_results(
+            "daemon_started", None, None, _response([_result(interval_seconds=60)])
+        )
+        assert "repeats: every 1m" in text
+        assert "run once here" in text
+
+    def test_no_cadence_line_for_one_shot_commands(self):
+        text = format_hook_test_results("daemon_started", None, None, _response([_result()]))
+        assert "repeats:" not in text
+
+    def test_interval_formatting(self):
+        for seconds, expected in [(30, "30s"), (60, "1m"), (90, "1m30s"), (3600, "1h"), (5400, "1h30m")]:
+            text = format_hook_test_results(
+                "daemon_started", None, None, _response([_result(interval_seconds=seconds)])
+            )
+            assert f"every {expected} " in text, f"{seconds}s rendered wrong: {text}"

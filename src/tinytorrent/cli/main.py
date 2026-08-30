@@ -10,7 +10,7 @@ from tinytorrent.cli import ipc_client
 from tinytorrent.cli.formatting import format_hook_test_results, format_torrent_table
 from tinytorrent.cli.ipc_client import DaemonUnreachableError
 from tinytorrent.common.config import Config, ConfigError, DEFAULT_CONFIG_PATH
-from tinytorrent.common.hooks import HookEvent
+from tinytorrent.common.hooks import DAEMON_EVENTS, HookEvent
 
 _PRIORITY_CHOICES = ["high", "normal", "low"]
 _HOOK_EVENT_CHOICES = [e.value for e in HookEvent]
@@ -57,7 +57,9 @@ def build_parser() -> argparse.ArgumentParser:
         "test", help="run an event's configured hook commands against a real torrent and show the results"
     )
     test_p.add_argument("--event", required=True, choices=_HOOK_EVENT_CHOICES, help="event to test")
-    test_p.add_argument("--id", default=None, help="torrent id to test against")
+    test_p.add_argument(
+        "--id", default=None, help="torrent id to test against (not used by the daemon_* events)"
+    )
     test_p.add_argument(
         "--name",
         default=None,
@@ -175,7 +177,10 @@ def _cmd_resume(config: Config, args: argparse.Namespace) -> int:
 
 
 def _cmd_test(config: Config, args: argparse.Namespace) -> int:
-    if not args.id and not args.name:
+    # The daemon-wide events describe the daemon rather than a torrent,
+    # so there is nothing to match against for those.
+    needs_torrent = HookEvent(args.event) not in DAEMON_EVENTS
+    if needs_torrent and not args.id and not args.name:
         print("error: must provide --id or --name", file=sys.stderr)
         return 1
     response = ipc_client.call(

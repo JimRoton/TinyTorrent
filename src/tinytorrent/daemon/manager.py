@@ -10,13 +10,13 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from tinytorrent.common.hooks import HookCommand, HookEvent
+from tinytorrent.common.hooks import DAEMON_EVENTS, HookCommand, HookEvent
 from tinytorrent.common.ids import generate_torrent_id
 from tinytorrent.common.priority import Priority
 from tinytorrent.daemon import magnet as magnet_module
 from tinytorrent.daemon import state_store
 from tinytorrent.daemon import torrent_info as ti
-from tinytorrent.daemon.hooks import HookRunner, build_context
+from tinytorrent.daemon.hooks import HookRunner, build_context, build_daemon_context
 from tinytorrent.daemon.magnet import MagnetParseError
 from tinytorrent.daemon.state_store import TorrentRecord
 from tinytorrent.daemon.scheduler import Scheduler, SchedulerError
@@ -34,10 +34,14 @@ class DaemonManager:
         *,
         max_active: int = 4,
         hooks: "dict[HookEvent, tuple[HookCommand, ...]] | None" = None,
+        socket_path: "Path | None" = None,
     ) -> None:
         self.download_dir = Path(download_dir)
         self.state_file = Path(state_file)
         self.our_peer_id = our_peer_id
+        # Carried only so daemon-wide hooks can report it via
+        # %socket_path%; the manager itself never touches the socket.
+        self.socket_path = Path(socket_path) if socket_path is not None else None
         self.scheduler = Scheduler(max_active=max_active)
         self.hook_runner = HookRunner(hooks)
         # torrent_id -> the exact magnet URI the user supplied. Kept
@@ -88,6 +92,25 @@ class DaemonManager:
     def _on_torrent_event(self, event: HookEvent, session: TorrentSession) -> None:
         self.hook_runner.fire(event, build_context(session))
 
+    def daemon_context(self, **extra: str) -> "dict[str, str]":
+        """Substitution context for the daemon-wide (torrent-less) events."""
+        return build_daemon_context(
+            download_dir=self.download_dir,
+            state_file=self.state_file,
+            socket_path=self.socket_path,
+            max_active=self.scheduler.max_active,
+            torrent_count=len(self.scheduler.list_sessions()),
+            **extra,
+        )
+
+    def fire_daemon_started(self) -> None:
+        """Fire ``daemon_started``, and start any repeating hooks it configures.
+
+        Called once the IPC socket is listening, so a hook is free to
+        shell out to the ``tinytorrent`` CLI.
+        """
+        self.hook_runner.fire(HookEvent.DAEMON_STARTED, self.daemon_context())
+
     # -- commands, mirroring the CLI 1:1 -----------------------------------
 
     async def add_torrent(self, magnet_uri: str, *, priority: Priority = Priority.NORMAL) -> str:
@@ -127,20 +150,33 @@ class DaemonManager:
         name: "str | None" = None,
         deleted_data: bool = False,
     ) -> "dict":
-        """Run every command configured for ``event`` against a real torrent
-        and report on each -- for ``tinytorrent test``. Does not perform
-        the real action associated with ``event`` (e.g. testing
-        ``torrent_purged`` does not actually purge anything); it only
-        substitutes that torrent's real data into the configured commands
-        and runs them, so a user can check their hook config works.
+        """Run every command configured for ``event`` and report on each --
+        for ``tinytorrent test``. Does not perform the real action
+        associated with ``event`` (e.g. testing ``torrent_purged`` does
+        not actually purge anything, and testing ``daemon_stopping``
+        does not stop the daemon); it only substitutes real data into
+        the configured commands and runs them, so a user can check their
+        hook config works.
+
+        For the daemon-wide events no torrent is involved, so
+        ``torrent_id``/``name`` are ignored and reported back as None.
+        A repeating command is run once, not on its schedule.
         """
-        session = self._resolve_torrent(torrent_id, name)
-        context = build_context(session, deleted_data="true" if deleted_data else "false")
+        if event in DAEMON_EVENTS:
+            # No torrent to resolve or report -- these events describe
+            # the daemon itself.
+            torrent_id, torrent_name = None, None
+            context = self.daemon_context()
+        else:
+            session = self._resolve_torrent(torrent_id, name)
+            torrent_id, torrent_name = session.torrent_id, session.display_name
+            context = build_context(session, deleted_data="true" if deleted_data else "false")
+
         commands = self.hook_runner.commands_for(event)
         results = await self.hook_runner.run_for_test(event, context)
         return {
-            "torrent_id": session.torrent_id,
-            "torrent_name": session.display_name,
+            "torrent_id": torrent_id,
+            "torrent_name": torrent_name,
             "configured": bool(commands),
             "results": results,
         }
@@ -187,6 +223,14 @@ class DaemonManager:
         return self.scheduler.get_session(torrent_id)
 
     async def shutdown(self) -> None:
+        # Stop the repeating daemon_started hooks first, so none of them
+        # fires a fresh run while the daemon is on its way down.
+        await self.hook_runner.cancel_repeating()
+        # daemon_stopping is awaited rather than fired: the process is
+        # about to exit, and a stop hook nobody waits for is useless.
+        # It runs before the torrents are stopped, so %torrent_count%
+        # still describes the daemon as it was.
+        await self.hook_runner.run_now(HookEvent.DAEMON_STOPPING, self.daemon_context())
         await self.scheduler.shutdown()
         # Capture any metadata fetched since the last save, so a restart
         # doesn't need to re-fetch it from peers.

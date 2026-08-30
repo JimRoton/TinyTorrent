@@ -453,3 +453,58 @@ class TestPauseResumeEndToEnd:
             assert code == 0
         finally:
             daemon.stop()
+
+
+class TestDaemonEventCliSupport:
+    def test_parser_accepts_the_daemon_events(self):
+        parser = cli_main.build_parser()
+        for event in ("daemon_started", "daemon_stopping"):
+            assert parser.parse_args(["test", "--event", event]).event == event
+
+    def test_daemon_event_does_not_require_id_or_name(self, monkeypatch, capsys):
+        captured = {}
+
+        def fake_call(socket_path, cmd, args=None, timeout=15.0):
+            captured["args"] = args
+            return Response.success(
+                {"torrent_id": None, "torrent_name": None, "configured": False, "results": []}
+            )
+
+        monkeypatch.setattr(cli_main.ipc_client, "call", fake_call)
+        assert cli_main.main(["test", "--event", "daemon_started"]) == 0
+        assert captured["args"]["event"] == "daemon_started"
+        assert "daemon-wide" in capsys.readouterr().out
+
+    def test_torrent_event_still_requires_id_or_name(self, monkeypatch, capsys):
+        def explode(*a, **kw):
+            raise AssertionError("the daemon should not have been contacted")
+
+        monkeypatch.setattr(cli_main.ipc_client, "call", explode)
+        assert cli_main.main(["test", "--event", "download_completed"]) == 1
+        assert "--id or --name" in capsys.readouterr().err
+
+    def test_prints_the_repeat_cadence(self, monkeypatch, capsys):
+        def fake_call(socket_path, cmd, args=None, timeout=15.0):
+            return Response.success(
+                {
+                    "torrent_id": None,
+                    "torrent_name": None,
+                    "configured": True,
+                    "results": [
+                        {
+                            "argv": ["health.sh"],
+                            "outcome": "ok",
+                            "returncode": 0,
+                            "output": "",
+                            "on_failure": "ignore",
+                            "interval_seconds": 60.0,
+                            "would_run_in_production": True,
+                        }
+                    ],
+                }
+            )
+
+        monkeypatch.setattr(cli_main.ipc_client, "call", fake_call)
+        assert cli_main.main(["test", "--event", "daemon_started"]) == 0
+        out = capsys.readouterr().out
+        assert "repeats: every 1m" in out

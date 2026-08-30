@@ -63,8 +63,36 @@ TinyTorrent can run user-configured commands when a torrent reaches certain poin
 | `download_completed` | The last needed piece was downloaded and verified. |
 | `download_error` | The download failed and the torrent entered the error state. |
 | `torrent_purged` | The torrent was removed via `purge`, after any `--with-data` deletion has happened. |
+| `daemon_started` | `tinytorrentd` has loaded its saved torrents and its IPC socket is listening. |
+| `daemon_stopping` | `tinytorrentd` is shutting down, before its torrents are stopped. |
 
 `download_completed` fires only on the transition from downloading to complete. A torrent that is found already complete on startup — its pieces re-verified from disk after a restart — does **not** fire it. The event means "this just finished downloading", not "this is confirmed complete", so a daemon restart cannot re-trigger a user's hook commands for torrents that finished long ago.
+
+### Daemon-wide events
+
+`daemon_started` and `daemon_stopping` describe the daemon rather than a torrent. That makes them different from the other five in three ways.
+
+**They have no torrent, so they have their own substitution context**: `%download_dir%`, `%state_file%`, `%socket_path%`, `%max_active%`, `%torrent_count%`, `%pid%`. None of the per-torrent placeholders are defined for them. Because an unrecognized placeholder is left as literal text, a torrent hook copied onto a daemon event degrades to a literal `%name%` argument instead of failing — a deliberate consequence of the existing substitution rule rather than a special case.
+
+**`daemon_started` fires after the IPC socket is listening**, not before. The alternative — firing early enough to prepare the environment before saved downloads resume — was rejected: hooks are fire-and-forget, so firing early would not actually guarantee the hook finished before downloading began, and it would break the more plausible use of shelling out to the `tinytorrent` CLI, which needs the socket. A hook that must complete before downloading starts would need a blocking pre-flight mechanism, which is a different feature.
+
+**`daemon_stopping` is awaited, unlike every other hook.** This is the one deliberate exception to fire-and-forget, for the obvious reason: the process is about to exit, so a stop hook nobody waits for is simply killed and the event would be useless. The cost is that a slow stop hook delays shutdown, bounded by its own `timeout_seconds` and ultimately by systemd's `TimeoutStopSec`. It runs before the torrents are stopped, so `%torrent_count%` still describes the daemon as it was.
+
+### Repeating commands
+
+A `daemon_started` command may carry `interval_seconds`, which runs it immediately at start-up and then repeatedly. This makes the daemon a small scheduler for those commands, living and dying with the daemon process.
+
+`interval_seconds` is valid **only** on `daemon_started`; anywhere else it is a config error. Repeating a per-torrent event has no unambiguous meaning — repeat per torrent, for how long, and what happens after it is purged? An event that fires exactly once at a known moment has an obvious answer, and restricting the key keeps the config surface honest about that.
+
+The interval is measured **from the end of one run to the start of the next**, not as a fixed wall-clock period. Two runs of the same command therefore never overlap, and a command slower than its interval backs off rather than piling up work the daemon can never drain. The cost is that the cadence drifts by the command's own duration, which is the more predictable failure mode of the two.
+
+A repeating command is detached from the event's ordered one-shot chain: it does not participate in that ordering, and `abort_remaining` neither skips it nor is triggered by it. For a repeating command `on_failure` instead governs the loop — `abort_remaining` stops repeating after a failed run, `ignore` keeps going — reading "remaining" as remaining *runs*. `timeout_seconds` still bounds each individual run, and a timeout counts as a failure.
+
+Because the key sits on the command rather than the event, one `daemon_started` can mix cadences — a 60-second health check, an hourly cleanup, and a one-shot announcement. A per-event interval could not express that, since there is only ever one `daemon_started`.
+
+Repeating tasks are the only hooks that outlive the event that started them, so shutdown cancels them explicitly before running `daemon_stopping`, and a command running at that moment is killed and reaped rather than orphaned.
+
+A minimum of 1 second is enforced when parsing, so a typo'd fraction cannot spin the daemon spawning subprocesses in a tight loop.
 
 ### Configuration
 
@@ -94,11 +122,15 @@ Firing an event schedules its commands as a background task and returns immediat
 
 The accepted consequence is that hook commands are not guaranteed to complete: the daemon does not wait for in-flight hooks when shutting down, so a long-running command can be cut short by a `systemctl restart`. Making shutdown block on arbitrary user commands would let a hung hook hold up a restart indefinitely, which is a worse failure than a hook occasionally not finishing.
 
+`daemon_stopping` is the single exception, and it is the exception that proves the rule: it is the one event whose whole purpose is to run *as* the daemon exits, so fire-and-forget would guarantee it never completed. It is awaited, and the risk above is accepted for it alone, bounded by each command's `timeout_seconds`.
+
 ### Testing hooks
 
 `tinytorrent test --event <event>` runs an event's configured commands immediately, against a real torrent's real data, and reports each result. Hook configuration is otherwise painful to iterate on: the natural trigger for `download_completed` is a completed download, which is a slow and awkward thing to arrange on demand.
 
-`test` deliberately differs from a real firing in three ways. It runs synchronously and reports outcomes, rather than firing and forgetting. It runs *every* configured command even after one fails, ignoring `abort_remaining`, so the user learns whether each command works rather than only reaching the first broken one — while still flagging which commands a real firing would have skipped. And it never performs the underlying action: testing `torrent_purged` runs the purge hooks but purges nothing.
+`test` deliberately differs from a real firing in four ways. It runs synchronously and reports outcomes, rather than firing and forgetting. It runs *every* configured command even after one fails, ignoring `abort_remaining`, so the user learns whether each command works rather than only reaching the first broken one — while still flagging which commands a real firing would have skipped. It runs a repeating command exactly once, however long its interval, reporting the configured cadence rather than making the user wait for it. And it never performs the underlying action: testing `torrent_purged` purges nothing, and testing `daemon_stopping` does not stop the daemon.
+
+The daemon-wide events take no `--id`/`--name`, since there is no torrent to resolve.
 
 ## Commands
 

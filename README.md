@@ -92,14 +92,18 @@ reasoning behind each choice below.
 }
 ```
 
-**Events**: `metadata_fetched`, `download_started`, `download_completed`,
-`download_error`, `torrent_purged`.
+**Torrent events**: `metadata_fetched`, `download_started`,
+`download_completed`, `download_error`, `torrent_purged`.
+
+**Daemon events**: `daemon_started`, `daemon_stopping` — see
+[Daemon events](#daemon-events) below.
 
 **Placeholders**, filled in per-command from the triggering torrent:
 `%id%`, `%name%`, `%status%`, `%download_dir%`, `%total_bytes%`,
 `%priority%`, `%info_hash%`, and — for `torrent_purged` only —
 `%deleted_data%` (`"true"`/`"false"`, whether `--with-data` was used). An
-unrecognized `%placeholder%` is left as literal text.
+unrecognized `%placeholder%` is left as literal text. The daemon events
+have their own, different set.
 
 **`command` is always an argv list, never a shell string.** Commands run
 via `execve`-style process spawning, not through `/bin/sh`. This means
@@ -134,6 +138,87 @@ BatchMode=yes` so an auth problem fails fast instead of hanging until
              "-r", "%download_dir%/%name%", "user@host:/dest/"]}
 ```
 
+### Daemon events
+
+Two events describe the daemon itself rather than a torrent.
+
+`daemon_started` fires once, just after `tinytorrentd` has loaded its
+saved torrents **and** its socket is listening — so a hook is free to
+shell out to the `tinytorrent` CLI. Note this is after saved downloads
+have already resumed; it is not a place to prepare the environment
+*before* downloading starts.
+
+`daemon_stopping` fires during shutdown, before the torrents are
+stopped. Unlike every other hook, **the daemon waits for it** — a stop
+hook nobody waits for would just be killed by the process exiting. Each
+command's `timeout_seconds` is therefore also a bound on how long
+shutdown can be held up, so keep stop hooks short (systemd will send
+SIGKILL after `TimeoutStopSec`, 90s by default).
+
+Neither event has a torrent, so they get their own placeholders:
+`%download_dir%`, `%state_file%`, `%socket_path%`, `%max_active%`,
+`%torrent_count%`, `%pid%`. The per-torrent placeholders simply don't
+exist for them — and since an unrecognized placeholder stays literal, a
+torrent hook copied onto a daemon event passes a literal `%name%` rather
+than failing.
+
+```json
+{
+  "hooks": {
+    "daemon_started": [
+      {"command": ["/usr/local/bin/announce-up.sh", "%pid%"]}
+    ],
+    "daemon_stopping": [
+      {"command": ["/usr/local/bin/announce-down.sh"], "timeout_seconds": 10}
+    ]
+  }
+}
+```
+
+### Repeating a command on an interval
+
+A `daemon_started` command may carry `interval_seconds`, which runs it
+immediately at start-up and then again on a repeating schedule — a small
+scheduler that lives and dies with the daemon:
+
+```json
+{
+  "hooks": {
+    "daemon_started": [
+      {
+        "command": ["/home/you/.config/tinytorrent/health-check.sh", "%download_dir%"],
+        "interval_seconds": 60,
+        "timeout_seconds": 30
+      }
+    ]
+  }
+}
+```
+
+`interval_seconds` is **only valid on `daemon_started`** (any other event
+is a config error) and must be at least 1 second. Repeating a per-torrent
+event has no unambiguous meaning; an event that fires once at a known
+moment does.
+
+Details worth knowing:
+
+- **The interval is the gap *between* runs, not a fixed period.** The
+  next run is scheduled after the previous one finishes, so two runs of
+  the same command never overlap and a slow command backs off instead of
+  piling up. A command taking 50s on a 60s interval runs about every
+  110s.
+- **A repeating command is detached from the one-shot chain.** It doesn't
+  take part in the ordering of the event's other commands, and
+  `abort_remaining` can neither skip it nor be triggered by it.
+- **`on_failure` on a repeating command means "stop repeating"**:
+  `abort_remaining` ends the loop after a failed run, `ignore` (the
+  default) keeps going. `timeout_seconds` still bounds each individual
+  run, and a timeout counts as a failure.
+- Repeating commands are cancelled when the daemon shuts down, and a
+  command running at that moment is killed.
+- Because intervals are per-command, one event can mix cadences: a
+  60-second health check, an hourly cleanup, and a one-shot announcement.
+
 ### Testing a hook without waiting for the real event
 
 `tinytorrent test` runs an event's configured commands right now, against
@@ -145,6 +230,7 @@ finish (or fail, or get purged):
 tinytorrent test --event download_completed --id a3f9
 tinytorrent test --event download_error --name "ubuntu.iso"
 tinytorrent test --event torrent_purged --id a3f9 --deleted-data
+tinytorrent test --event daemon_started
 ```
 
 Match by `--id` (checked first) or `--name` (tried if `--id` is omitted,
@@ -152,6 +238,11 @@ or if it wasn't found and `--name` was also given; ambiguous name matches
 are rejected — use `--id` instead). `--deleted-data` only matters for
 `--event torrent_purged`, and only sets the `%deleted_data%` placeholder
 — running this command never actually purges anything.
+
+The daemon events take neither `--id` nor `--name`, since they have no
+torrent. Testing `daemon_stopping` does not stop the daemon, and a
+command with `interval_seconds` is run **once**, with its configured
+cadence reported so you can see it without waiting for it.
 
 Unlike a real firing, `test` blocks and prints every configured command's
 outcome (`ok` / `FAILED` / `TIMED OUT` / `COULD NOT START`), including

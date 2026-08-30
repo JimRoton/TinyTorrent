@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import sys
+import time
 
 import pytest
 
@@ -509,3 +510,258 @@ class TestTestHook:
             assert result["torrent_id"] == torrent_id
 
         _run(scenario())
+
+
+def _repeating_hook(argv, interval_seconds=0.2, on_failure="ignore"):
+    return HookCommand(
+        argv=tuple(argv),
+        on_failure=on_failure,
+        timeout_seconds=30.0,
+        interval_seconds=interval_seconds,
+    )
+
+
+async def _wait_for(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.01)
+    return False
+
+
+class TestDaemonContext:
+    def test_reports_the_daemon_settings(self, tmp_path):
+        manager = DaemonManager(
+            tmp_path / "downloads",
+            tmp_path / "state.json",
+            generate_peer_id(),
+            max_active=7,
+            socket_path=tmp_path / "d.sock",
+        )
+        context = manager.daemon_context()
+        assert context["download_dir"] == str(tmp_path / "downloads")
+        assert context["state_file"] == str(tmp_path / "state.json")
+        assert context["socket_path"] == str(tmp_path / "d.sock")
+        assert context["max_active"] == "7"
+        assert context["torrent_count"] == "0"
+
+    def test_torrent_count_tracks_added_torrents(self, tmp_path):
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", tmp_path / "state.json", generate_peer_id())
+            await manager.add_torrent(_no_tracker_magnet(hash_byte=b"\x01"))
+            await manager.add_torrent(_no_tracker_magnet(hash_byte=b"\x02"))
+            assert manager.daemon_context()["torrent_count"] == "2"
+
+        _run(scenario())
+
+    def test_socket_path_is_optional(self, tmp_path):
+        manager = DaemonManager(tmp_path / "downloads", tmp_path / "state.json", generate_peer_id())
+        assert manager.daemon_context()["socket_path"] == ""
+
+
+class TestDaemonStartedHook:
+    def test_fires_configured_commands(self, tmp_path):
+        marker = tmp_path / "started"
+
+        async def scenario():
+            hooks = {
+                HookEvent.DAEMON_STARTED: (_hook(_py(f"open({str(marker)!r}, 'w').write('x')")),)
+            }
+            manager = DaemonManager(
+                tmp_path / "downloads", tmp_path / "state.json", generate_peer_id(), hooks=hooks
+            )
+            manager.fire_daemon_started()
+            await manager.hook_runner.wait_idle()
+
+        _run(scenario())
+        assert marker.exists()
+
+    def test_receives_the_daemon_context(self, tmp_path):
+        out = tmp_path / "context"
+
+        async def scenario():
+            argv = _py("import sys; open(sys.argv[1], 'w').write(sys.argv[2])") + (
+                str(out),
+                "%max_active%",
+            )
+            manager = DaemonManager(
+                tmp_path / "downloads",
+                tmp_path / "state.json",
+                generate_peer_id(),
+                max_active=3,
+                hooks={HookEvent.DAEMON_STARTED: (_hook(argv),)},
+            )
+            manager.fire_daemon_started()
+            await manager.hook_runner.wait_idle()
+
+        _run(scenario())
+        assert out.read_text() == "3"
+
+    def test_starts_repeating_commands(self, tmp_path):
+        ticks = tmp_path / "ticks"
+
+        async def scenario():
+            argv = _py(f"open({str(ticks)!r}, 'a').write('x')")
+            manager = DaemonManager(
+                tmp_path / "downloads",
+                tmp_path / "state.json",
+                generate_peer_id(),
+                hooks={HookEvent.DAEMON_STARTED: (_repeating_hook(argv),)},
+            )
+            manager.fire_daemon_started()
+            reached = await _wait_for(
+                lambda: ticks.exists() and len(ticks.read_text()) >= 2
+            )
+            await manager.shutdown()
+            return reached
+
+        assert _run(scenario()) is True
+
+    def test_no_hooks_configured_is_harmless(self, tmp_path):
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", tmp_path / "state.json", generate_peer_id())
+            manager.fire_daemon_started()
+            await manager.hook_runner.wait_idle()
+
+        _run(scenario())
+
+
+class TestDaemonStoppingHook:
+    def test_shutdown_runs_and_waits_for_stop_hooks(self, tmp_path):
+        marker = tmp_path / "stopped"
+
+        async def scenario():
+            hooks = {
+                HookEvent.DAEMON_STOPPING: (_hook(_py(f"open({str(marker)!r}, 'w').write('x')")),)
+            }
+            manager = DaemonManager(
+                tmp_path / "downloads", tmp_path / "state.json", generate_peer_id(), hooks=hooks
+            )
+            await manager.shutdown()
+            # Awaited, not fired -- it has already run by the time
+            # shutdown() returns, with no wait_idle() needed.
+            assert marker.exists()
+
+        _run(scenario())
+
+    def test_stop_hook_sees_torrents_before_they_are_stopped(self, tmp_path):
+        out = tmp_path / "count"
+
+        async def scenario():
+            argv = _py("import sys; open(sys.argv[1], 'w').write(sys.argv[2])") + (
+                str(out),
+                "%torrent_count%",
+            )
+            manager = DaemonManager(
+                tmp_path / "downloads",
+                tmp_path / "state.json",
+                generate_peer_id(),
+                hooks={HookEvent.DAEMON_STOPPING: (_hook(argv),)},
+            )
+            await manager.add_torrent(_no_tracker_magnet())
+            await manager.shutdown()
+
+        _run(scenario())
+        assert out.read_text() == "1"
+
+    def test_shutdown_stops_repeating_hooks(self, tmp_path):
+        ticks = tmp_path / "ticks"
+
+        async def scenario():
+            argv = _py(f"open({str(ticks)!r}, 'a').write('x')")
+            manager = DaemonManager(
+                tmp_path / "downloads",
+                tmp_path / "state.json",
+                generate_peer_id(),
+                hooks={HookEvent.DAEMON_STARTED: (_repeating_hook(argv),)},
+            )
+            manager.fire_daemon_started()
+            await _wait_for(lambda: ticks.exists())
+            await manager.shutdown()
+            settled = len(ticks.read_text())
+            await asyncio.sleep(0.6)  # several intervals
+            return settled, len(ticks.read_text())
+
+        settled, after = _run(scenario())
+        assert after <= settled + 1
+
+    def test_shutdown_without_stop_hooks_still_works(self, tmp_path):
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", tmp_path / "state.json", generate_peer_id())
+            await manager.add_torrent(_no_tracker_magnet())
+            await manager.shutdown()
+            assert (tmp_path / "state.json").exists()
+
+        _run(scenario())
+
+
+class TestTestHookForDaemonEvents:
+    def test_needs_no_torrent(self, tmp_path):
+        marker = tmp_path / "ran"
+
+        async def scenario():
+            hooks = {
+                HookEvent.DAEMON_STARTED: (_hook(_py(f"open({str(marker)!r}, 'w').write('x')")),)
+            }
+            manager = DaemonManager(
+                tmp_path / "downloads", tmp_path / "state.json", generate_peer_id(), hooks=hooks
+            )
+            return await manager.test_hook(HookEvent.DAEMON_STARTED)
+
+        result = _run(scenario())
+        assert marker.exists()
+        assert result["torrent_id"] is None
+        assert result["torrent_name"] is None
+        assert result["configured"] is True
+
+    def test_daemon_stopping_can_be_tested(self, tmp_path):
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", tmp_path / "state.json", generate_peer_id())
+            return await manager.test_hook(HookEvent.DAEMON_STOPPING)
+
+        result = _run(scenario())
+        assert result["configured"] is False
+
+    def test_testing_daemon_stopping_does_not_stop_anything(self, tmp_path):
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", tmp_path / "state.json", generate_peer_id())
+            await manager.add_torrent(_no_tracker_magnet())
+            await manager.test_hook(HookEvent.DAEMON_STOPPING)
+            assert len(manager.list_torrents()) == 1
+
+        _run(scenario())
+
+    def test_a_supplied_torrent_id_is_ignored(self, tmp_path):
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", tmp_path / "state.json", generate_peer_id())
+            torrent_id = await manager.add_torrent(_no_tracker_magnet())
+            result = await manager.test_hook(HookEvent.DAEMON_STARTED, torrent_id=torrent_id)
+            assert result["torrent_id"] is None
+
+        _run(scenario())
+
+    def test_an_unknown_torrent_id_is_not_an_error(self, tmp_path):
+        async def scenario():
+            manager = DaemonManager(tmp_path / "downloads", tmp_path / "state.json", generate_peer_id())
+            result = await manager.test_hook(HookEvent.DAEMON_STARTED, torrent_id="zzzz")
+            assert result["torrent_id"] is None
+
+        _run(scenario())
+
+    def test_repeating_command_runs_once(self, tmp_path):
+        ticks = tmp_path / "ticks"
+
+        async def scenario():
+            argv = _py(f"open({str(ticks)!r}, 'a').write('x')")
+            manager = DaemonManager(
+                tmp_path / "downloads",
+                tmp_path / "state.json",
+                generate_peer_id(),
+                hooks={HookEvent.DAEMON_STARTED: (_repeating_hook(argv, interval_seconds=60),)},
+            )
+            results = await manager.test_hook(HookEvent.DAEMON_STARTED)
+            assert results["results"][0]["interval_seconds"] == 60.0
+
+        _run(scenario())
+        assert len(ticks.read_text()) == 1

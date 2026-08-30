@@ -509,3 +509,75 @@ class TestTestCommand:
                     writer.close()
 
         _run(scenario())
+
+
+class TestDaemonEventTestCommand:
+    def test_daemon_started_needs_no_torrent(self, tmp_path):
+        marker = tmp_path / "ran"
+
+        async def scenario():
+            async with _ServerFixture(tmp_path) as fx:
+                fx.manager.hook_runner = HookRunner(
+                    {
+                        HookEvent.DAEMON_STARTED: (
+                            HookCommand(
+                                argv=(sys.executable, "-c", f"open({str(marker)!r}, 'w').write('x')"),
+                                timeout_seconds=30.0,
+                            ),
+                        )
+                    }
+                )
+                reader, writer = await fx.connect()
+                try:
+                    resp = await _send(
+                        reader, writer, {"cmd": "test", "args": {"event": "daemon_started"}}
+                    )
+                    assert resp["ok"] is True
+                    assert resp["data"]["torrent_id"] is None
+                    assert resp["data"]["torrent_name"] is None
+                    assert resp["data"]["results"][0]["outcome"] == "ok"
+                finally:
+                    writer.close()
+
+        _run(scenario())
+        assert marker.exists()
+
+    def test_daemon_stopping_needs_no_torrent(self, tmp_path):
+        async def scenario():
+            async with _ServerFixture(tmp_path) as fx:
+                reader, writer = await fx.connect()
+                try:
+                    resp = await _send(
+                        reader, writer, {"cmd": "test", "args": {"event": "daemon_stopping"}}
+                    )
+                    assert resp["ok"] is True
+                    assert resp["data"]["configured"] is False
+                finally:
+                    writer.close()
+
+        _run(scenario())
+
+    def test_daemon_event_reports_the_configured_interval(self, tmp_path):
+        async def scenario():
+            async with _ServerFixture(tmp_path) as fx:
+                fx.manager.hook_runner = HookRunner(
+                    {
+                        HookEvent.DAEMON_STARTED: (
+                            HookCommand(
+                                argv=(sys.executable, "-c", "pass"),
+                                timeout_seconds=30.0,
+                                interval_seconds=60.0,
+                            ),
+                        )
+                    }
+                )
+                reader, writer = await fx.connect()
+                try:
+                    resp = await _send(
+                        reader, writer, {"cmd": "test", "args": {"event": "daemon_started"}}
+                    )
+                    assert resp["data"]["results"][0]["interval_seconds"] == 60.0
+                finally:
+                    writer.close()
+
+        _run(scenario())

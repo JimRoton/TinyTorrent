@@ -13,6 +13,19 @@ commands to finish -- a slow or hung command can't stall downloading or
 scheduling. One consequence, by design: hook commands are not guaranteed
 to finish before the daemon exits (e.g. a systemd restart).
 
+``daemon_stopping`` is the one exception, run via ``run_now`` rather than
+``fire``: the daemon awaits it during shutdown. A stop hook that isn't
+waited for is useless, since the process exits out from under it. Each
+command's ``timeout_seconds`` is what bounds how long shutdown can be
+held up.
+
+A ``daemon_started`` command carrying ``interval_seconds`` is detached
+from that event's ordered chain into its own repeating task, which runs
+the command immediately and then again after each run finishes. Those
+tasks are the only hooks that outlive the event that started them, so
+they are tracked separately and cancelled by ``cancel_repeating`` when
+the daemon shuts down.
+
 ``HookRunner.run_for_test`` is the other entry point (used by
 ``tinytorrent test``): unlike ``fire``, it runs synchronously (the caller
 awaits it) and unconditionally runs every configured command for an
@@ -24,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass
 
 from tinytorrent.common.hooks import HookCommand, HookEvent, substitute_argv
@@ -32,6 +46,7 @@ from tinytorrent.daemon.torrent_session import TorrentSession
 logger = logging.getLogger(__name__)
 
 _OUTPUT_CAPTURE_LIMIT = 4000  # cap captured stdout/stderr, both for logging and for `test`
+_KILL_REAP_TIMEOUT = 5.0  # how long to wait to collect a killed child's status
 
 
 @dataclass(frozen=True)
@@ -50,18 +65,85 @@ class HookRunner:
     def __init__(self, hooks: "dict[HookEvent, tuple[HookCommand, ...]] | None" = None):
         self._hooks = hooks or {}
         self._tasks: "set[asyncio.Task]" = set()
+        # Repeating tasks are kept apart from ``_tasks`` because they
+        # never finish on their own -- ``wait_idle`` would hang on them.
+        self._repeating: "set[asyncio.Task]" = set()
 
     def commands_for(self, event: HookEvent) -> "tuple[HookCommand, ...]":
         return self._hooks.get(event, ())
 
     def fire(self, event: HookEvent, context: "dict[str, str]") -> None:
-        """Schedule this event's configured commands to run; do not wait."""
+        """Schedule this event's configured commands to run; do not wait.
+
+        Commands carrying ``interval_seconds`` are split out into their
+        own repeating tasks; the rest keep the existing ordered
+        one-shot chain, including ``on_failure`` propagation between
+        them.
+        """
         commands = self._hooks.get(event)
         if not commands:
             return
-        task = asyncio.ensure_future(self._run_event(event, commands, context))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+
+        one_shot = tuple(c for c in commands if not c.repeats)
+        repeating = tuple(c for c in commands if c.repeats)
+
+        if one_shot:
+            task = asyncio.ensure_future(self._run_event(event, one_shot, context))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+        for command in repeating:
+            task = asyncio.ensure_future(self._repeat(event, command, context))
+            self._repeating.add(task)
+            task.add_done_callback(self._repeating.discard)
+
+    async def run_now(self, event: HookEvent, context: "dict[str, str]") -> None:
+        """Run this event's commands and wait for them to finish.
+
+        Used for ``daemon_stopping``, where fire-and-forget would mean
+        the commands are killed by the process exiting.
+        """
+        commands = self._hooks.get(event)
+        if not commands:
+            return
+        await self._run_event(event, commands, context)
+
+    async def cancel_repeating(self) -> None:
+        """Cancel every repeating (``interval_seconds``) hook task, and wait.
+
+        Awaiting the cancelled tasks matters: a repeating command may be
+        mid-subprocess, and this is what gives it the chance to kill and
+        reap that child before the daemon's event loop goes away.
+        """
+        tasks = list(self._repeating)
+        self._repeating.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _repeat(
+        self, event: HookEvent, command: HookCommand, context: "dict[str, str]"
+    ) -> None:
+        """Run one command immediately, then again after each run finishes.
+
+        The wait happens *after* a run completes rather than on a fixed
+        wall-clock period, so two runs of the same command never overlap
+        and a command slower than its interval backs off instead of
+        piling up.
+        """
+        while True:
+            argv = substitute_argv(command.argv, context)
+            result = await self._run_one(event, argv, command.timeout_seconds)
+            self._log_result(event, result)
+            if result.outcome != "ok" and command.on_failure == "abort_remaining":
+                logger.info(
+                    "hook for %s: %r failed with on_failure=abort_remaining, not repeating it again",
+                    event.value,
+                    result.argv,
+                )
+                return
+            await asyncio.sleep(command.interval_seconds)
 
     async def wait_idle(self) -> None:
         """Wait for all currently-scheduled hook runs to finish.
@@ -82,6 +164,10 @@ class HookRunner:
         ones production would have reached. Each result also reports
         whether that command *would* have run in real (production)
         usage, given ``on_failure`` and the outcome of earlier commands.
+
+        A repeating command is run exactly once here, however long its
+        ``interval_seconds`` is; the configured interval is reported so
+        the user can see the cadence without waiting for it.
         """
         results = []
         would_run = True
@@ -95,9 +181,15 @@ class HookRunner:
                     "returncode": result.returncode,
                     "output": result.output,
                     "on_failure": command.on_failure,
+                    "interval_seconds": command.interval_seconds,
                     "would_run_in_production": would_run,
                 }
             )
+            # A repeating command runs on its own schedule, so it never
+            # takes part in the one-shot chain's abort propagation --
+            # neither being skipped by it nor causing it.
+            if command.repeats:
+                continue
             if would_run and result.outcome != "ok" and command.on_failure == "abort_remaining":
                 would_run = False  # every command from here on would have been skipped
         return results
@@ -135,6 +227,19 @@ class HookRunner:
             proc.kill()
             await proc.wait()
             return CommandResult(argv=argv_t, outcome="timeout", returncode=None, output="")
+        except asyncio.CancelledError:
+            # Cancellation (a repeating hook stopped at shutdown) must not
+            # leave the child running. Shield the reap so the same
+            # cancellation doesn't interrupt the cleanup, and bound it so
+            # shutdown can never block on a child that won't be reaped --
+            # the kill signal is what matters, collecting the status is
+            # only tidiness.
+            proc.kill()
+            try:
+                await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=_KILL_REAP_TIMEOUT)
+            except (asyncio.TimeoutError, asyncio.CancelledError, ProcessLookupError):
+                pass
+            raise
 
         text = output[-_OUTPUT_CAPTURE_LIMIT:].decode("utf-8", errors="replace").strip()
         outcome = "ok" if proc.returncode == 0 else "failed"
@@ -152,6 +257,35 @@ class HookRunner:
             logger.warning(
                 "hook for %s: %r exited %s: %s", event.value, result.argv, result.returncode, result.output
             )
+
+
+def build_daemon_context(
+    *,
+    download_dir,
+    state_file,
+    socket_path,
+    max_active: int,
+    torrent_count: int,
+    **extra: str,
+) -> "dict[str, str]":
+    """Build the ``%placeholder%`` context for a daemon-wide event.
+
+    ``daemon_started`` and ``daemon_stopping`` have no torrent, so none
+    of the per-torrent placeholders exist for them. An unrecognized
+    placeholder is left as literal text (see ``substitute_argv``), so a
+    torrent hook copied onto a daemon event degrades to a literal
+    ``%name%`` argument rather than failing.
+    """
+    context = {
+        "download_dir": str(download_dir),
+        "state_file": str(state_file),
+        "socket_path": "" if socket_path is None else str(socket_path),
+        "max_active": str(max_active),
+        "torrent_count": str(torrent_count),
+        "pid": str(os.getpid()),
+    }
+    context.update(extra)
+    return context
 
 
 def build_context(session: TorrentSession, **extra: str) -> "dict[str, str]":
